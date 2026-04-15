@@ -1,0 +1,82 @@
+-- =============================================================
+-- VWAP Alert System — ClickHouse Schema
+-- File này tự động chạy khi container khởi động lần đầu
+-- =============================================================
+
+-- Tạo database
+CREATE DATABASE IF NOT EXISTS vwap;
+
+-- ---------------------------------------------------------------
+-- 1. trades_raw: lưu toàn bộ tick giao dịch (nguồn sự thật)
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS vwap.trades_raw
+(
+    received_at  DateTime64(3, 'Asia/Ho_Chi_Minh'),
+    symbol       LowCardinality(String),
+    price        Float64,
+    quantity     Int64,
+    total_volume Int64,
+    board_id     Int16,
+    market_id    Int16
+)
+ENGINE = MergeTree()
+PARTITION BY toDate(received_at)
+ORDER BY (symbol, received_at)
+TTL toDate(received_at) + INTERVAL 90 DAY
+SETTINGS index_granularity = 8192;
+
+-- ---------------------------------------------------------------
+-- 2. kafka_trades: Kafka Engine — cổng nhận message từ Kafka
+--    Chú ý: broker dùng tên service Docker (kafka:29092)
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS vwap.kafka_trades
+(
+    received_at  String,
+    symbol       String,
+    price        Float64,
+    quantity     Int64,
+    total_volume Int64,
+    board_id     Int16,
+    market_id    Int16
+)
+ENGINE = Kafka
+SETTINGS
+    kafka_broker_list        = 'kafka:29092',
+    kafka_topic_list         = 'dnse.trades',
+    kafka_group_name         = 'clickhouse_vwap_consumer',
+    kafka_format             = 'JSONEachRow',
+    kafka_num_consumers      = 1,
+    kafka_max_block_size     = 65536,
+    kafka_skip_broken_messages = 10;
+
+-- ---------------------------------------------------------------
+-- 3. Materialized View: tự động chuyển kafka_trades → trades_raw
+-- ---------------------------------------------------------------
+CREATE MATERIALIZED VIEW IF NOT EXISTS vwap.kafka_to_trades_raw
+TO vwap.trades_raw
+AS
+SELECT
+    parseDateTime64BestEffort(received_at, 3, 'Asia/Ho_Chi_Minh') AS received_at,
+    symbol,
+    price,
+    quantity,
+    total_volume,
+    board_id,
+    market_id
+FROM vwap.kafka_trades;
+
+-- ---------------------------------------------------------------
+-- 4. alerts: lưu cảnh báo VWAP do detector ghi vào
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS vwap.alerts
+(
+    alert_time    DateTime64(3, 'Asia/Ho_Chi_Minh'),
+    symbol        LowCardinality(String),
+    alert_type    String,          -- BREAKOUT_UP | BREAKDOWN
+    price         Float64,
+    vwap          Float64,
+    deviation_pct Float64
+)
+ENGINE = MergeTree()
+ORDER BY (alert_time, symbol)
+TTL toDate(alert_time) + INTERVAL 90 DAY;

@@ -1,0 +1,40 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+myenv
+
+# uv
+uv.lock
+
+.env
+
+**/multirun
+output**
+infra*
+
+# Agent-related config and guides
+docs/
+vnstock-agent-guide/
+.agent/
+.cursor/
+.github/
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+
+.DS_Store
+
+# Airflow
+airflow/logs/
+airflow/.env
+airflow/airflow.db
+airflow/airflow.cfg
+airflow/webserver_config.py
+airflow/standalone_admin_password.txt

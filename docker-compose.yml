@@ -1,0 +1,247 @@
+# DATN — một file compose cho toàn dự án
+#
+# Cơ sở (ClickHouse 1 shard × 2 replica + Keeper, MinIO):
+#   docker compose up -d
+#
+# Thêm pipeline streaming VWAP (ZooKeeper + Kafka + Kafka UI):
+#   docker compose --profile vwap up -d
+#
+# Cổng (host):
+#   ClickHouse HTTP: 8123 (node-01), 8124 (node-02) | Native: 9000, 9001
+#   Keeper: 9181 | MinIO S3: 9100 | MinIO Console: http://localhost:9101
+#   Kafka (profile vwap): 9092 | Kafka UI: http://localhost:8080
+#
+# VWAP: schema ClickHouse (`vwap` DB, Kafka Engine) được mount vào clickhouse-01
+# (chạy lần đầu khi volume trống). MinIO dùng chung instance ở trên — xem vwap_system/.env.example
+#
+# Dữ liệu persistent dùng named volumes do Docker quản lý.
+
+x-airflow-common: &airflow-common
+  image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:2.9.2}
+  networks:
+    - datn-project-net
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__WEBSERVER__SECRET_KEY: "mysecretkey123" 
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    _PIP_ADDITIONAL_REQUIREMENTS: ""
+  volumes:
+    - ${AIRFLOW_PROJ_DIR:-./airflow}/dags:/opt/airflow/dags
+    - ${AIRFLOW_PROJ_DIR:-./airflow}/logs:/opt/airflow/logs
+    - ${AIRFLOW_PROJ_DIR:-./airflow}/plugins:/opt/airflow/plugins
+    - ${AIRFLOW_PROJ_DIR:-./airflow}/requirements.txt:/requirements_airflow.txt
+    - ${AIRFLOW_PROJ_DIR:-./airflow}/.env:/opt/airflow/.env
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  clickhouse-keeper:
+    image: clickhouse/clickhouse-keeper:latest-alpine
+    user: "101:101"
+    container_name: clickhouse-student-keeper
+    hostname: clickhouse-keeper
+    volumes:
+      - ${CONFIG_ROOT:-./clickhouse_student}/fs/volumes/clickhouse-keeper/etc/clickhouse-keeper/keeper_config.xml:/etc/clickhouse-keeper/keeper_config.xml
+    ports:
+      - "9181:9181"
+    networks:
+      - datn-project-net
+
+  clickhouse-01:
+    image: clickhouse/clickhouse-server:latest
+    user: "101:101"
+    container_name: clickhouse-student-01
+    hostname: clickhouse-01
+    depends_on:
+      - clickhouse-keeper
+    environment:
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: default
+    volumes:
+      - ${CONFIG_ROOT:-./clickhouse_student}/fs/volumes/clickhouse-01/etc/clickhouse-server/config.d/config.xml:/etc/clickhouse-server/config.d/config.xml
+      - clickhouse_01_data:/var/lib/clickhouse
+      # VWAP: chỉ node-01 (Kafka consumer — tránh ăn trùng message trên replica)
+      - ./vwap_system/clickhouse/init.sql:/docker-entrypoint-initdb.d/02_vwap_init.sql:ro
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    networks:
+      - datn-project-net
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--user", "default", "--password", "default", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  clickhouse-02:
+    image: clickhouse/clickhouse-server:latest
+    user: "101:101"
+    container_name: clickhouse-student-02
+    hostname: clickhouse-02
+    depends_on:
+      - clickhouse-keeper
+    environment:
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: default
+    volumes:
+      - ${CONFIG_ROOT:-./clickhouse_student}/fs/volumes/clickhouse-02/etc/clickhouse-server/config.d/config.xml:/etc/clickhouse-server/config.d/config.xml
+      - clickhouse_02_data:/var/lib/clickhouse
+    ports:
+      - "8124:8123"
+      - "9001:9000"
+    networks:
+      - datn-project-net
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--user", "default", "--password", "default", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    container_name: datn-project-minio
+    hostname: minio
+    ports:
+      - "9100:9000"
+      - "9101:9001"
+    volumes:
+      - minio_storage:/data
+    environment:
+      MINIO_ROOT_USER: minio_access_key
+      MINIO_ROOT_PASSWORD: minio_secret_key
+    command: server --console-address ":9001" /data
+    networks:
+      - datn-project-net
+
+  # --- VWAP streaming (bật: docker compose --profile vwap up -d) ---
+  vwap-zookeeper:
+    profiles: [vwap]
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: datn-vwap-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - datn-project-net
+
+  vwap-kafka:
+    profiles: [vwap]
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: datn-vwap-kafka
+    hostname: kafka
+    depends_on:
+      - vwap-zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: vwap-zookeeper:2181
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 24
+    networks:
+      - datn-project-net
+
+  vwap-kafka-ui:
+    profiles: [vwap]
+    image: provectuslabs/kafka-ui:latest
+    container_name: datn-vwap-kafka-ui
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: datn-vwap
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: vwap-zookeeper:2181
+    depends_on:
+      - vwap-kafka
+      - vwap-zookeeper
+    networks:
+      - datn-project-net
+
+  # --- Airflow ---
+  postgres:
+    image: postgres:13
+    container_name: datn-airflow-postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    networks:
+      - datn-project-net
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: datn-airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - >
+        mkdir -p /sources/logs /sources/dags /sources/plugins &&
+        chown -R "$${AIRFLOW_UID:-50000}:0" /sources/logs /sources/dags /sources/plugins &&
+        exec /entrypoint airflow version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+    user: "0:0"
+    volumes:
+      - ${AIRFLOW_PROJ_DIR:-./airflow}:/sources
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: datn-airflow-scheduler
+    command: >
+      bash -c "[ -f /requirements_airflow.txt ] && pip install -r /requirements_airflow.txt; airflow scheduler"
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: datn-airflow-webserver
+    command: >
+      bash -c "[ -f /requirements_airflow.txt ] && pip install -r /requirements_airflow.txt; airflow webserver"
+    restart: always
+    ports:
+      - "8083:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  clickhouse_01_data:
+  clickhouse_02_data:
+  minio_storage:
+  postgres-db-volume:
+
+networks:
+  datn-project-net:
+    driver: bridge

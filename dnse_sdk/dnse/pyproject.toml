@@ -1,0 +1,12 @@
+[project]
+name = "dnse"
+version = "1.0.0"
+description = "DNSE REST API SDK"
+requires-python = ">=3.8"
+dependencies = [
+    "urllib3>=2.0",
+]
+
+[tool.setuptools]
+packages = ["dnse"]
+package-dir = {"dnse" = "."}
