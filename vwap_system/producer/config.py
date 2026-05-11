@@ -14,7 +14,11 @@ class Config:
 
     # Kafka
     KAFKA_BOOTSTRAP_SERVERS: str = os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092')
-    KAFKA_TOPIC: str = os.getenv('KAFKA_TOPIC', 'dnse.trades')
+    KAFKA_TRADES_TOPIC: str = os.getenv('KAFKA_TOPIC', 'dnse.trades')
+    KAFKA_OHLC_TOPIC: str = os.getenv('KAFKA_OHLC_TOPIC', 'dnse.ohlc')
+
+    # Resolution cho OHLC (DNSE WebSocket: "1" ~ 1 phút)
+    OHLC_RESOLUTION: str = os.getenv('OHLC_RESOLUTION', '1')
 
     # Danh sách mã chứng khoán cần theo dõi
     SYMBOLS: list = os.getenv('SYMBOLS', 'HPG,SSI,VNM,VCB,TCB').split(',')

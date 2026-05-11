@@ -17,7 +17,10 @@
 # Dữ liệu persistent dùng named volumes do Docker quản lý.
 
 x-airflow-common: &airflow-common
-  image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:2.9.2}
+  # Dùng stock image — không cần build custom.
+  # vnstock_data nằm trong Docker volume vnstock-venv, mount vào /opt/vnstock-venv.
+  # Chạy `docker compose run --rm vnstock-setup` 1 lần trước khi up Airflow.
+  image: apache/airflow:2.9.2-python3.10
   networks:
     - datn-project-net
   environment: &airflow-common-env
@@ -25,7 +28,7 @@ x-airflow-common: &airflow-common
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
     AIRFLOW__CORE__FERNET_KEY: ''
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
-    AIRFLOW__WEBSERVER__SECRET_KEY: "mysecretkey123" 
+    AIRFLOW__WEBSERVER__SECRET_KEY: "mysecretkey123"
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
     _PIP_ADDITIONAL_REQUIREMENTS: ""
@@ -33,8 +36,15 @@ x-airflow-common: &airflow-common
     - ${AIRFLOW_PROJ_DIR:-./airflow}/dags:/opt/airflow/dags
     - ${AIRFLOW_PROJ_DIR:-./airflow}/logs:/opt/airflow/logs
     - ${AIRFLOW_PROJ_DIR:-./airflow}/plugins:/opt/airflow/plugins
-    - ${AIRFLOW_PROJ_DIR:-./airflow}/requirements.txt:/requirements_airflow.txt
-    - ${AIRFLOW_PROJ_DIR:-./airflow}/.env:/opt/airflow/.env
+    - ./.env:/opt/airflow/.env
+    # venv chứa vnstock_data (read-only) — tạo bởi vnstock-setup
+    - vnstock-venv:/opt/vnstock-venv:ro
+    # home dir của vnii — cần ghi được để vnii tạo/đọc device id, license cache
+    - vnstock-home:/opt/vnstock-home
+    # Scripts ingestion/transform — BashOperator gọi /opt/vnstock-venv/bin/python
+    - ./market_ingestion:/opt/airflow/scripts/market_ingestion:ro
+    - ./reference_ingestion:/opt/airflow/scripts/reference_ingestion:ro
+    - ./transformed:/opt/airflow/scripts/transformed:ro
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
     postgres:
@@ -68,6 +78,8 @@ services:
       - clickhouse_01_data:/var/lib/clickhouse
       # VWAP: chỉ node-01 (Kafka consumer — tránh ăn trùng message trên replica)
       - ./vwap_system/clickhouse/init.sql:/docker-entrypoint-initdb.d/02_vwap_init.sql:ro
+      # Master warehouse trên MinIO (dim/fact)
+      - ./clickhouse_student/init/03_stock_data_init.sql:/docker-entrypoint-initdb.d/03_stock_data_init.sql:ro
     ports:
       - "8123:8123"
       - "9000:9000"
@@ -171,6 +183,43 @@ services:
     networks:
       - datn-project-net
 
+  # --- vnstock venv setup (chạy 1 lần trước khi up Airflow) ---
+  # Lệnh: docker compose run --rm vnstock-setup
+  # Tạo /opt/vnstock-venv trong Docker volume, cài vnstock_data qua CLI installer.
+  # Nếu volume đã tồn tại và có python → bỏ qua, không cài lại.
+  # Để cài lại từ đầu: docker volume rm <project>_vnstock-venv
+  vnstock-setup:
+    profiles: [setup]
+    image: apache/airflow:2.9.2-python3.10
+    user: root
+    container_name: datn-vnstock-setup
+    environment:
+      VNSTOCK_API_KEY: ${VNSTOCK_API_KEY}
+    volumes:
+      - vnstock-venv:/opt/vnstock-venv
+      - vnstock-home:/opt/vnstock-home
+      - ./airflow/requirements.txt:/tmp/requirements.txt:ro
+    command: >
+      bash -c "
+        if [ -f /opt/vnstock-venv/bin/python ]; then
+          echo 'venv da ton tai tai /opt/vnstock-venv — bo qua setup.';
+          echo 'De cai lai: docker compose down && docker volume rm <project>_vnstock-venv <project>_vnstock-home';
+        else
+          python3 -m venv /opt/vnstock-venv &&
+          /opt/vnstock-venv/bin/pip install --no-cache-dir --ignore-installed -r /tmp/requirements.txt &&
+          curl -fsSL https://vnstocks.com/files/vnstock-cli-installer.run -o /tmp/installer.run &&
+          chmod +x /tmp/installer.run &&
+          . /opt/vnstock-venv/bin/activate &&
+          HOME=/opt/vnstock-home /tmp/installer.run -- --non-interactive --api-key \"$$VNSTOCK_API_KEY\" --venv-path /opt/vnstock-venv --language en &&
+          /opt/vnstock-venv/bin/pip install --no-cache-dir --ignore-installed -r /tmp/requirements.txt &&
+          chmod -R 755 /opt/vnstock-venv &&
+          chmod -R 755 /opt/vnstock-home &&
+          echo 'Setup hoan tat! Co the chay: docker compose up -d';
+        fi
+      "
+    networks:
+      - datn-project-net
+
   # --- Airflow ---
   postgres:
     image: postgres:13
@@ -213,8 +262,7 @@ services:
   airflow-scheduler:
     <<: *airflow-common
     container_name: datn-airflow-scheduler
-    command: >
-      bash -c "[ -f /requirements_airflow.txt ] && pip install -r /requirements_airflow.txt; airflow scheduler"
+    command: airflow scheduler
     restart: always
     depends_on:
       postgres:
@@ -225,8 +273,7 @@ services:
   airflow-webserver:
     <<: *airflow-common
     container_name: datn-airflow-webserver
-    command: >
-      bash -c "[ -f /requirements_airflow.txt ] && pip install -r /requirements_airflow.txt; airflow webserver"
+    command: airflow webserver
     restart: always
     ports:
       - "8083:8080"
@@ -241,6 +288,10 @@ volumes:
   clickhouse_02_data:
   minio_storage:
   postgres-db-volume:
+  # venv chứa vnstock_data — tạo bởi `docker compose run --rm vnstock-setup`
+  vnstock-venv:
+  # home dir của vnii (device id, license cache) — ghi được, dùng chung setup + Airflow
+  vnstock-home:
 
 networks:
   datn-project-net:

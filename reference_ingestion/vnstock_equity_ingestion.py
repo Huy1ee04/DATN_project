@@ -32,8 +32,8 @@ for _env_path in [
 
 from vnstock_data import Reference
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
-logger = logging.getLogger('equity_ingestion')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("equity_ingestion")
 ICT = timezone(timedelta(hours=7))
 
 # Setup VNSTOCK Sponsor API Key
@@ -56,10 +56,21 @@ DEFAULT_S3_PREFIX = "raw/reference"
 
 
 def _add_ingested_at(df: pd.DataFrame) -> pd.DataFrame:
-    """Add ingested_at timestamp column (ICT timezone)."""
     df = df.copy()
     df["ingested_at"] = datetime.now(ICT)
     return df
+
+
+def _write_parquet_and_log(
+    df: pd.DataFrame,
+    fs: s3fs.S3FileSystem,
+    s3_path: str,
+    success_prefix: str = "Uploaded",
+) -> None:
+    with fs.open(s3_path, "wb") as f:
+        df.to_parquet(f, engine="pyarrow", index=False, compression="snappy")
+    size_kb = (fs.size(s3_path) or 0) / 1024
+    logger.info(f"{success_prefix} s3://{s3_path} ({size_kb:.1f} KB, {len(df):,} rows)")
 
 
 def write_parquet_to_s3(
@@ -75,10 +86,7 @@ def write_parquet_to_s3(
         logger.info(f"Exists, skipping: s3://{s3_path}  (use --append to merge)")
         return
     df = _add_ingested_at(df)
-    with fs.open(s3_path, "wb") as f:
-        df.to_parquet(f, engine="pyarrow", index=False, compression="snappy")
-    size_kb = (fs.size(s3_path) or 0) / 1024
-    logger.info(f"Uploaded s3://{s3_path} ({size_kb:.1f} KB, {len(df):,} rows)")
+    _write_parquet_and_log(df, fs, s3_path, success_prefix="Uploaded")
 
 
 def append_parquet_to_s3(
@@ -123,33 +131,37 @@ def append_parquet_to_s3(
     if before != after:
         logger.info(f"Dedup: {before - after:,} duplicate rows removed → {after:,} rows kept")
 
-    with fs.open(s3_path, "wb") as f:
-        df_combined.to_parquet(f, engine="pyarrow", index=False, compression="snappy")
-    file_size = fs.size(s3_path)
-    size_kb = file_size / 1024 if file_size is not None else 0
-    logger.info(f"✅ Appended → s3://{s3_path} ({size_kb:.1f} KB, {after:,} rows total)")
+    _write_parquet_and_log(df_combined, fs, s3_path, success_prefix="Appended ->")
 
 
-def parse_args():
-    p = argparse.ArgumentParser(description="Fetch VNStock Equity Data to MinIO S3.")
-    p.add_argument("--bucket", default=DEFAULT_BUCKET,    help="MinIO bucket name")
-    p.add_argument("--prefix", default=DEFAULT_S3_PREFIX, help="Path prefix inside bucket")
-    p.add_argument("--append", action="store_true",       help="Ghi tiếp vào file cũ, deduplicate theo symbol")
-    return p.parse_args()
+def log_run_info(args: argparse.Namespace, prefix: str) -> None:
+    separator = "=" * 80
+    mode = "append" if args.append else "write (skip if exists)"
+    run_at = datetime.now(ICT).strftime("%Y-%m-%d %H:%M:%S %Z")
+    logger.info(
+        "\n%s\nFetch VNStock Equity Data to MinIO S3\n%s\n"
+        "MinIO Endpoint : %s\n"
+        "Target prefix  : s3://%s/equity/\n"
+        "Mode           : %s\n"
+        "Run at         : %s\n%s",
+        separator, separator,
+        MINIO_ENDPOINT,
+        prefix,
+        mode,
+        run_at,
+        separator,
+    )
 
 
-def main():
-    args   = parse_args()
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Fetch VNStock Equity Data to MinIO S3.")
+    parser.add_argument("--bucket", default=DEFAULT_BUCKET,    help="MinIO bucket name")
+    parser.add_argument("--prefix", default=DEFAULT_S3_PREFIX, help="Path prefix inside bucket")
+    parser.add_argument("--append", action="store_true",       help="Ghi tiếp vào file cũ, deduplicate theo symbol")
+    args = parser.parse_args()
+
     prefix = f"{args.bucket}/{args.prefix}"
-
-    print("=" * 80)
-    print("Fetch VNStock Equity Data to MinIO S3")
-    print("=" * 80)
-    print(f"MinIO Endpoint : {MINIO_ENDPOINT}")
-    print(f"Target prefix  : s3://{prefix}/equity/")
-    print(f"Mode           : {'append' if args.append else 'write (skip if exists)'}")
-    print(f"Run at         : {datetime.now(ICT).strftime('%Y-%m-%d %H:%M:%S %Z')}")
-    print("=" * 80)
+    log_run_info(args, prefix)
 
     fs = s3fs.S3FileSystem(
         key=MINIO_ACCESS_KEY,
@@ -194,9 +206,8 @@ def main():
     except Exception as e:
         logger.error(f"Error fetching VN30 members: {e}")
 
-    print("\n" + "=" * 80)
-    logger.info("🎉 Equity ingestion complete!")
-    print("=" * 80)
+    separator = "=" * 80
+    logger.info("\n%s\nEquity ingestion complete!\n%s", separator, separator)
 
 
 if __name__ == "__main__":

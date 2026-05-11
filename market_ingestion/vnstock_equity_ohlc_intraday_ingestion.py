@@ -77,6 +77,18 @@ def _add_ingested_at(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _write_parquet_and_log(
+    df: pd.DataFrame,
+    fs: s3fs.S3FileSystem,
+    s3_path: str,
+    success_prefix: str = "Uploaded",
+) -> None:
+    with fs.open(s3_path, "wb") as fh:
+        df.to_parquet(fh, engine="pyarrow", index=False, compression="snappy")
+    size_kb = (fs.size(s3_path) or 0) / 1024
+    logger.info(f"{success_prefix} s3://{s3_path} ({size_kb:.1f} KB, {len(df):,} rows)")
+
+
 def _df_with_partition_date(df: pd.DataFrame) -> pd.DataFrame | None:
     """Thêm cột _partition_date (date only) để hive-style partition YYYY/MM/DD."""
     if df is None or df.empty:
@@ -106,10 +118,7 @@ def write_parquet_to_s3(df: pd.DataFrame, fs: s3fs.S3FileSystem, s3_path: str) -
         logger.info(f"Exists, skipping: s3://{s3_path}  (use --append to merge)")
         return
     df = _add_ingested_at(df)
-    with fs.open(s3_path, "wb") as fh:
-        df.to_parquet(fh, engine="pyarrow", index=False, compression="snappy")
-    size_kb = (fs.size(s3_path) or 0) / 1024
-    logger.info(f"✅ Uploaded s3://{s3_path} ({size_kb:.1f} KB, {len(df):,} rows)")
+    _write_parquet_and_log(df, fs, s3_path, success_prefix="Uploaded")
 
 
 def append_parquet_to_s3(
@@ -152,10 +161,7 @@ def append_parquet_to_s3(
     if before != after:
         logger.info(f"Dedup: {before - after:,} rows removed → {after:,} kept")
 
-    with fs.open(s3_path, "wb") as fh:
-        df_combined.to_parquet(fh, engine="pyarrow", index=False, compression="snappy")
-    size_kb = (fs.size(s3_path) or 0) / 1024
-    logger.info(f"✅ Appended → s3://{s3_path} ({size_kb:.1f} KB, {after:,} rows total)")
+    _write_parquet_and_log(df_combined, fs, s3_path, success_prefix="Appended ->")
 
 
 def write_ohlc_partitioned_parquet(
@@ -361,27 +367,39 @@ def parse_args():
     return p.parse_args()
 
 
-def main():
-    args = parse_args()
-
-    market_prefix = f"{args.bucket}/{args.market_prefix}"
-    now = datetime.now(ICT)
-
-    print("=" * 80)
-    print("Fetch VNStock Equity Intraday OHLCV → MinIO S3 (Parquet, partitioned)")
-    print("=" * 80)
+def log_run_info(args: argparse.Namespace, market_prefix: str) -> None:
+    separator = "=" * 80
     symbol_source = (
         "--symbols flag" if args.symbols
         else f"Reference API (exchange={args.exchange}, type={args.instrument_type})"
     )
-    print(f"MinIO Endpoint    : {MINIO_ENDPOINT}")
-    print(f"Interval          : {args.interval}")
-    print(f"Date range        : {args.start}  →  {args.end}")
-    print(f"Symbol source     : {symbol_source}")
-    print(f"Target output     : s3://{market_prefix}/equity/year=YYYY/month=MM/day=DD/ohlc.parquet")
-    print(f"Mode              : {'append' if args.append else 'write (skip if exists)'}")
-    print(f"Run at            : {now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-    print("=" * 80)
+    mode = "append" if args.append else "write (skip if exists)"
+    run_at = datetime.now(ICT).strftime("%Y-%m-%d %H:%M:%S %Z")
+    logger.info(
+        "\n%s\nFetch VNStock Equity Intraday OHLCV → MinIO S3 (Parquet, partitioned)\n%s\n"
+        "MinIO Endpoint    : %s\n"
+        "Interval          : %s\n"
+        "Date range        : %s  →  %s\n"
+        "Symbol source     : %s\n"
+        "Target output     : s3://%s/equity/year=YYYY/month=MM/day=DD/ohlc.parquet\n"
+        "Mode              : %s\n"
+        "Run at            : %s\n%s",
+        separator, separator,
+        MINIO_ENDPOINT,
+        args.interval,
+        args.start, args.end,
+        symbol_source,
+        market_prefix,
+        mode,
+        run_at,
+        separator,
+    )
+
+
+def main():
+    args = parse_args()
+    market_prefix = f"{args.bucket}/{args.market_prefix}"
+    log_run_info(args, market_prefix)
 
     fs = s3fs.S3FileSystem(
         key=MINIO_ACCESS_KEY,
@@ -418,9 +436,8 @@ def main():
         append=args.append,
     )
 
-    print("\n" + "=" * 80)
-    logger.info("🎉 Intraday OHLCV ingestion complete!")
-    print("=" * 80)
+    separator = "=" * 80
+    logger.info("\n%s\nIntraday equity OHLCV ingestion complete!\n%s", separator, separator)
 
 
 if __name__ == "__main__":

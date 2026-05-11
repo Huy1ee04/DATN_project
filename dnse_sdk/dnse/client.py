@@ -88,6 +88,17 @@ class DNSEClient:
             dry_run=dry_run,
         )
 
+    def get_execution_detail(self, account_no, order_id, market_type, order_category="NORMAL", dry_run=False):
+        query = {"marketType": market_type}
+        if order_category:
+            query["orderCategory"] = order_category
+        return self._request(
+            "GET",
+            f"/accounts/{account_no}/executions/{order_id}",
+            query=query,
+            dry_run=dry_run,
+        )
+
     def get_order_history(
             self,
             account_no,
@@ -133,7 +144,7 @@ class DNSEClient:
             query["boardId"] = board_id
         return self._request(
             "GET",
-            f"/price/secdef/{symbol}",
+            f"/price/{symbol}/secdef",
             query=query if query else None,
             dry_run=dry_run,
         )
@@ -198,6 +209,24 @@ class DNSEClient:
             "GET",
             f"/price/{symbol}/trades/latest",
             query=query if query else None,
+            dry_run=dry_run,
+        )
+
+    def get_close_price(self, symbol, board_id=None, dry_run=False):
+        query = {}
+        if board_id is not None:
+            query["boardId"] = board_id
+        return self._request(
+            "GET",
+            f"/price/{symbol}/close",
+            query=query if query else None,
+            dry_run=dry_run,
+        )
+
+    def get_working_dates(self, dry_run=False):
+        return self._request(
+            "GET",
+            f"/market/working-dates",
             dry_run=dry_run,
         )
 
@@ -274,14 +303,13 @@ class DNSEClient:
             dry_run=dry_run,
         )
 
-    def close_position(self, position_id, market_type, payload, trading_token, dry_run=False):
+    def close_position(self, position_id, market_type, trading_token, dry_run=False):
         headers = {"trading-token": trading_token}
         query = {"marketType": market_type}
         return self._request(
             "POST",
             f"/accounts/positions/{position_id}/close",
             query=query,
-            body=payload,
             headers=headers,
             dry_run=dry_run,
         )

@@ -5,7 +5,7 @@ from typing import Optional, AsyncIterator
 
 import certifi
 import websockets
-from websockets.client import WebSocketClientProtocol
+from websockets import ClientConnection
 from .exceptions import ConnectionError, ConnectionClosed
 
 logger = logging.getLogger(__name__)
@@ -51,7 +51,7 @@ class WebSocketConnection:
         self.auto_reconnect = auto_reconnect
         self.max_retries = max_retries
 
-        self._ws: Optional[WebSocketClientProtocol] = None
+        self._ws: Optional[ClientConnection] = None
         self._retry_count = 0
         self._is_connected = False
 
@@ -75,7 +75,7 @@ class WebSocketConnection:
                                        ping_interval=30,
                                        ping_timeout=30,
                                        close_timeout=10,
-                                       max_queue=None), timeout=self.timeout)
+                                       max_queue=512), timeout=self.timeout)
 
                 self._is_connected = True
                 self._retry_count = 0
@@ -108,21 +108,20 @@ class WebSocketConnection:
             return message if isinstance(message, bytes) else message.encode()
         except websockets.exceptions.ConnectionClosed as e:
             self._is_connected = False
+            code = e.rcvd.code if e.rcvd else 1006
 
-            # Handle different close codes
-            if e.code in (1000, 1001):  # Normal closure, going away
-                logger.info(f"Connection closed normally: {e.code}")
-                raise ConnectionClosed(f"Connection closed normally: {e}")
-            elif e.code in (1006, 1011, 1012):  # Abnormal, server error, restart
-                logger.warning(f"Connection closed abnormally: {e.code}")
+            if code in (1000, 1001):  # Normal closure, going away
+                logger.info(f"Connection closed normally: {code}")
+                raise ConnectionClosed(f"Connection closed normally: {code}")
+            elif code in (1006, 1011, 1012):  # Abnormal, server error, restart
+                logger.warning(f"Connection closed abnormally: {code}")
                 if self.auto_reconnect:
-                    # Reconnection will be handled by caller
-                    raise ConnectionClosed(f"Connection closed abnormally: {e}", recoverable=True)
+                    raise ConnectionClosed(f"Connection closed abnormally: {code}", recoverable=True)
                 else:
-                    raise ConnectionClosed(f"Connection closed abnormally: {e}")
+                    raise ConnectionClosed(f"Connection closed abnormally: {code}")
             else:
-                logger.error(f"Connection closed with unexpected code: {e.code}")
-                raise ConnectionClosed(f"Connection closed: {e}")
+                logger.error(f"Connection closed with unexpected code: {code}")
+                raise ConnectionClosed(f"Connection closed: {code}", recoverable=True)
 
     async def close(self) -> None:
         """Close connection gracefully"""
@@ -145,5 +144,8 @@ class WebSocketConnection:
         """Get next message"""
         try:
             return await self.receive()
-        except ConnectionClosed:
+        except ConnectionClosed as e:
+            if e.recoverable:
+                # Re-raise so _message_handler can trigger reconnection
+                raise
             raise StopAsyncIteration

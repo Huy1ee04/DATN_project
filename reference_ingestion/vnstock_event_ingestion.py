@@ -31,8 +31,8 @@ for _env_path in [
 
 from vnstock_data import Reference
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
-logger = logging.getLogger('event_ingestion')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("event_ingestion")
 ICT = timezone(timedelta(hours=7))
 
 # Setup VNSTOCK Sponsor API Key
@@ -55,10 +55,21 @@ DEFAULT_S3_PREFIX = "raw/reference"
 
 
 def _add_ingested_at(df: pd.DataFrame) -> pd.DataFrame:
-    """Add ingested_at timestamp column (ICT timezone)."""
     df = df.copy()
     df["ingested_at"] = datetime.now(ICT)
     return df
+
+
+def _write_parquet_and_log(
+    df: pd.DataFrame,
+    fs: s3fs.S3FileSystem,
+    s3_path: str,
+    success_prefix: str = "Uploaded",
+) -> None:
+    with fs.open(s3_path, "wb") as f:
+        df.to_parquet(f, engine="pyarrow", index=False, compression="snappy")
+    size_kb = (fs.size(s3_path) or 0) / 1024
+    logger.info(f"{success_prefix} s3://{s3_path} ({size_kb:.1f} KB, {len(df):,} rows)")
 
 
 def write_parquet_to_s3(
@@ -74,10 +85,7 @@ def write_parquet_to_s3(
         logger.info(f"Exists, skipping: s3://{s3_path}  (use --append to merge)")
         return
     df = _add_ingested_at(df)
-    with fs.open(s3_path, "wb") as f:
-        df.to_parquet(f, engine="pyarrow", index=False, compression="snappy")
-    size_kb = (fs.size(s3_path) or 0) / 1024
-    logger.info(f"Uploaded s3://{s3_path} ({size_kb:.1f} KB, {len(df):,} rows)")
+    _write_parquet_and_log(df, fs, s3_path, success_prefix="Uploaded")
 
 
 def append_parquet_to_s3(
@@ -122,33 +130,38 @@ def append_parquet_to_s3(
     if before != after:
         logger.info(f"Dedup: {before - after:,} duplicate rows removed → {after:,} rows kept")
 
-    with fs.open(s3_path, "wb") as f:
-        df_combined.to_parquet(f, engine="pyarrow", index=False, compression="snappy")
-    file_size = fs.size(s3_path)
-    size_kb = file_size / 1024 if file_size is not None else 0
-    logger.info(f"✅ Appended → s3://{s3_path} ({size_kb:.1f} KB, {after:,} rows total)")
+    _write_parquet_and_log(df_combined, fs, s3_path, success_prefix="Appended ->")
 
 
-def parse_args():
-    p = argparse.ArgumentParser(description="Fetch VNStock Event Data to MinIO S3.")
-    p.add_argument("--bucket", default=DEFAULT_BUCKET,    help="MinIO bucket name")
-    p.add_argument("--prefix", default=DEFAULT_S3_PREFIX, help="Path prefix inside bucket")
-    p.add_argument("--append", action="store_true",       help="Ghi tiếp vào file cũ, deduplicate theo (event_name, notify_date, symbol)")
-    return p.parse_args()
+def log_run_info(args: argparse.Namespace, event_s3_path: str) -> None:
+    separator = "=" * 80
+    mode = "append" if args.append else "write (skip if exists)"
+    run_at = datetime.now(ICT).strftime("%Y-%m-%d %H:%M:%S %Z")
+    logger.info(
+        "\n%s\nFetch VNStock Event Data to MinIO S3\n%s\n"
+        "MinIO Endpoint : %s\n"
+        "Target output  : s3://%s\n"
+        "Mode           : %s\n"
+        "Run at         : %s\n%s",
+        separator, separator,
+        MINIO_ENDPOINT,
+        event_s3_path,
+        mode,
+        run_at,
+        separator,
+    )
 
 
-def main():
-    args   = parse_args()
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Fetch VNStock Event Data to MinIO S3.")
+    parser.add_argument("--bucket", default=DEFAULT_BUCKET,    help="MinIO bucket name")
+    parser.add_argument("--prefix", default=DEFAULT_S3_PREFIX, help="Path prefix inside bucket")
+    parser.add_argument("--append", action="store_true",       help="Ghi tiếp vào file cũ, deduplicate theo (event_name, notify_date, symbol)")
+    args = parser.parse_args()
+
     prefix = f"{args.bucket}/{args.prefix}"
-
-    print("=" * 80)
-    print("Fetch VNStock Event Data to MinIO S3")
-    print("=" * 80)
-    print(f"MinIO Endpoint : {MINIO_ENDPOINT}")
-    print(f"Target output  : s3://{prefix}/event/event.parquet")
-    print(f"Mode           : {'append' if args.append else 'write (skip if exists)'}")
-    print(f"Run at         : {datetime.now(ICT).strftime('%Y-%m-%d %H:%M:%S %Z')}")
-    print("=" * 80)
+    event_s3_path = f"{prefix}/event/event.parquet"
+    log_run_info(args, event_s3_path)
 
     fs = s3fs.S3FileSystem(
         key=MINIO_ACCESS_KEY,
@@ -161,18 +174,16 @@ def main():
     logger.info("Fetching market events via ref.events.market()...")
     try:
         df_events = ref.events.market()
-        event_path = f"{prefix}/event/event.parquet"
         if args.append:
-            append_parquet_to_s3(df_events, fs, event_path,
+            append_parquet_to_s3(df_events, fs, event_s3_path,
                                  dedup_keys=["event_name", "notify_date", "symbol"])
         else:
-            write_parquet_to_s3(df_events, fs, event_path)
+            write_parquet_to_s3(df_events, fs, event_s3_path)
     except Exception as e:
-        logger.error(f"Error fetching Events: {e}")
+        logger.error(f"Error fetching events: {e}")
 
-    print("\n" + "=" * 80)
-    logger.info("🎉 Event ingestion complete!")
-    print("=" * 80)
+    separator = "=" * 80
+    logger.info("\n%s\nEvent ingestion complete!\n%s", separator, separator)
 
 
 if __name__ == "__main__":

@@ -29,8 +29,8 @@ for _env_path in [
 
 from vnstock_data import Reference
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
-logger = logging.getLogger('company_ingestion')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("company_info_ingestion")
 ICT = timezone(timedelta(hours=7))
 
 # Setup VNSTOCK Sponsor API Key
@@ -51,15 +51,29 @@ MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minio_secret_key")
 DEFAULT_BUCKET    = os.getenv("MINIO_BUCKET", "stock-data")
 DEFAULT_S3_PREFIX = "raw/reference"
 
-COMPANY_BATCH_SIZE    = 50      # Print progress every 50 symbols
-COMPANY_PER_REQ_DELAY = 0.33     # Delay 0.33s = ~180 req/min
-WAIT_TIME_ON_ERROR    = 65      # Seconds to wait when hitting error/timeout/rate limit
+COMPANY_BATCH_SIZE    = 50
+COMPANY_PER_REQ_DELAY = 0.33
+WAIT_TIME_ON_ERROR    = 65
+MAX_RETRIES           = 5
+
 
 def _add_ingested_at(df: pd.DataFrame) -> pd.DataFrame:
-    """Add ingested_at timestamp column (ICT timezone)."""
     df = df.copy()
     df["ingested_at"] = datetime.now(ICT)
     return df
+
+
+def _write_parquet_and_log(
+    df: pd.DataFrame,
+    fs: s3fs.S3FileSystem,
+    s3_path: str,
+    success_prefix: str = "Uploaded",
+) -> None:
+    with fs.open(s3_path, "wb") as f:
+        df.to_parquet(f, engine="pyarrow", index=False, compression="snappy")
+    size_kb = (fs.size(s3_path) or 0) / 1024
+    logger.info(f"{success_prefix} s3://{s3_path} ({size_kb:.1f} KB, {len(df):,} rows)")
+
 
 def write_parquet_to_s3(
     df: pd.DataFrame,
@@ -74,11 +88,7 @@ def write_parquet_to_s3(
         logger.info(f"Exists, skipping: s3://{s3_path}  (use --append to merge)")
         return
     df = _add_ingested_at(df)
-    with fs.open(s3_path, "wb") as f:
-        df.to_parquet(f, engine="pyarrow", index=False, compression="snappy")
-    file_size = fs.size(s3_path)
-    size_kb = file_size / 1024 if file_size is not None else 0
-    logger.info(f"✅ Uploaded s3://{s3_path} ({size_kb:.1f} KB, {len(df):,} rows)")
+    _write_parquet_and_log(df, fs, s3_path, success_prefix="Uploaded")
 
 
 def append_parquet_to_s3(
@@ -123,11 +133,8 @@ def append_parquet_to_s3(
     if before != after:
         logger.info(f"Dedup: {before - after:,} duplicate rows removed → {after:,} rows kept")
 
-    with fs.open(s3_path, "wb") as f:
-        df_combined.to_parquet(f, engine="pyarrow", index=False, compression="snappy")
-    file_size = fs.size(s3_path)
-    size_kb = file_size / 1024 if file_size is not None else 0
-    logger.info(f"✅ Appended → s3://{s3_path} ({size_kb:.1f} KB, {after:,} rows total)")
+    _write_parquet_and_log(df_combined, fs, s3_path, success_prefix="Appended ->")
+
 
 def _normalize_symbols(series: pd.Series) -> list[str]:
     """Chuẩn hóa Series mã: strip, upper, bỏ NA/rỗng, dedup."""
@@ -137,10 +144,14 @@ def _normalize_symbols(series: pd.Series) -> list[str]:
     )
 
 
-def fetch_exchange_symbols(exchange: str = "HOSE", instrument_type: str = "STOCK") -> list[str]:
+def fetch_exchange_symbols(
+    ref: Reference,
+    exchange: str = "HOSE",
+    instrument_type: str = "STOCK",
+) -> list[str]:
     """Lấy danh sách mã từ Reference API, lọc theo exchange + type."""
     try:
-        df_all = Reference().equity.list_by_exchange()
+        df_all = ref.equity.list_by_exchange()
         if df_all is None or df_all.empty:
             logger.warning("list_by_exchange() returned empty DataFrame.")
             return []
@@ -165,20 +176,33 @@ def fetch_exchange_symbols(exchange: str = "HOSE", instrument_type: str = "STOCK
         return []
 
 
-def fetch_company_info_with_retry(symbol: str) -> pd.DataFrame:
-    """Fetch company.info() with retry on rate-limit/timeout errors."""
-    while True:
+def fetch_company_info_with_retry(
+    ref: Reference,
+    symbol: str,
+    max_retries: int = MAX_RETRIES,
+) -> pd.DataFrame:
+    for attempt in range(1, max_retries + 1):
         try:
-            return Reference().company(symbol).info()
-        except (Exception, SystemExit) as e:
+            return ref.company(symbol).info()
+        except Exception as e:
+            if attempt == max_retries:
+                logger.error(
+                    f"{symbol} - Failed after {max_retries} attempts: {e}. Skipping symbol."
+                )
+                break
             logger.warning(
-                f"{symbol} — Error (RateLimit/Timeout/API): {e}. "
+                f"{symbol} - Attempt {attempt}/{max_retries} failed: {e}. "
                 f"Waiting {WAIT_TIME_ON_ERROR} seconds before retry..."
             )
             time.sleep(WAIT_TIME_ON_ERROR)
+    return pd.DataFrame()
 
-def fetch_company_info_concat(symbols: list[str]) -> pd.DataFrame:
-    """Call company.info() for each symbol; concatenate non-empty results."""
+
+def fetch_company_info_concat(
+    ref: Reference,
+    symbols: list[str],
+    max_retries: int = MAX_RETRIES,
+) -> pd.DataFrame:
     total = len(symbols)
     results: list[pd.DataFrame] = []
     empty_count = 0
@@ -186,7 +210,7 @@ def fetch_company_info_concat(symbols: list[str]) -> pd.DataFrame:
     logger.info(f"Fetching company.info() for {total} symbols...")
 
     for i, symbol in enumerate(symbols, start=1):
-        df = fetch_company_info_with_retry(symbol)
+        df = fetch_company_info_with_retry(ref, symbol, max_retries=max_retries)
         if df is not None and not df.empty:
             results.append(df)
         else:
@@ -207,28 +231,41 @@ def fetch_company_info_concat(symbols: list[str]) -> pd.DataFrame:
     logger.info(f"Concatenated {len(df_all):,} rows from {len(results)} symbols.")
     return df_all
 
-def main():
-    p = argparse.ArgumentParser(description="Fetch VNStock Company Data to MinIO S3.")
-    p.add_argument("--bucket",  default=DEFAULT_BUCKET,    help="MinIO bucket name")
-    p.add_argument("--prefix",  default=DEFAULT_S3_PREFIX, help="Path prefix inside bucket")
-    p.add_argument("--exchange", default="HOSE",           help="Sàn lọc từ Reference API: HOSE, HNX, UPCOM (default: HOSE)")
-    p.add_argument("--instrument-type", default="STOCK", dest="instrument_type",
-                   help="Loại CK: STOCK, ETF, … (default: STOCK)")
-    p.add_argument("--append",  action="store_true",       help="Ghi tiếp vào file cũ, deduplicate theo symbol")
-    args = p.parse_args()
+
+def log_run_info(args: argparse.Namespace, info_s3_path: str) -> None:
+    separator = "=" * 80
+    mode = "append" if args.append else "write (skip if exists)"
+    run_at = datetime.now(ICT).strftime("%Y-%m-%d %H:%M:%S %Z")
+    logger.info(
+        "\n%s\nFetch VNStock Company Info to MinIO S3\n%s\n"
+        "MinIO Endpoint    : %s\n"
+        "Symbol source     : Reference API (exchange=%s, type=%s)\n"
+        "Target output     : s3://%s\n"
+        "Mode              : %s\n"
+        "Run at            : %s\n%s",
+        separator, separator,
+        MINIO_ENDPOINT,
+        args.exchange, args.instrument_type,
+        info_s3_path,
+        mode,
+        run_at,
+        separator,
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Fetch VNStock Company Info to MinIO S3.")
+    parser.add_argument("--bucket",  default=DEFAULT_BUCKET,    help="MinIO bucket name")
+    parser.add_argument("--prefix",  default=DEFAULT_S3_PREFIX, help="Path prefix inside bucket")
+    parser.add_argument("--exchange", default="HOSE",           help="Sàn lọc từ Reference API: HOSE, HNX, UPCOM (default: HOSE)")
+    parser.add_argument("--instrument-type", default="STOCK", dest="instrument_type",
+                        help="Loại CK: STOCK, ETF, … (default: STOCK)")
+    parser.add_argument("--append",  action="store_true",       help="Ghi tiếp vào file cũ, deduplicate theo symbol")
+    args = parser.parse_args()
 
     prefix = f"{args.bucket}/{args.prefix}"
     info_s3_path = f"{prefix}/company/info/info.parquet"
-
-    print("=" * 80)
-    print("Fetch VNStock Company Info to MinIO S3")
-    print("=" * 80)
-    print(f"MinIO Endpoint    : {MINIO_ENDPOINT}")
-    print(f"Symbol source     : Reference API (exchange={args.exchange}, type={args.instrument_type})")
-    print(f"Target output     : s3://{info_s3_path}")
-    print(f"Mode              : {'append' if args.append else 'write (skip if exists)'}")
-    print(f"Run at            : {datetime.now(ICT).strftime('%Y-%m-%d %H:%M:%S %Z')}")
-    print("=" * 80)
+    log_run_info(args, info_s3_path)
 
     fs = s3fs.S3FileSystem(
         key=MINIO_ACCESS_KEY,
@@ -236,21 +273,25 @@ def main():
         client_kwargs={"endpoint_url": MINIO_ENDPOINT},
     )
 
-    symbols = fetch_exchange_symbols(exchange=args.exchange, instrument_type=args.instrument_type)
+    ref = Reference()
+    symbols = fetch_exchange_symbols(
+        ref,
+        exchange=args.exchange,
+        instrument_type=args.instrument_type,
+    )
     if not symbols:
         logger.error("No symbols loaded — aborting.")
         return
 
-    logger.info("Fetching company.info() for all symbols → single info.parquet...")
-    df_company = fetch_company_info_concat(symbols)
+    df_company = fetch_company_info_concat(ref, symbols)
     if args.append:
         append_parquet_to_s3(df_company, fs, info_s3_path, dedup_keys=["symbol"])
     else:
         write_parquet_to_s3(df_company, fs, info_s3_path)
 
-    print("\n" + "=" * 80)
-    logger.info("🎉 Company ingestion complete!")
-    print("=" * 80)
+    separator = "=" * 80
+    logger.info("\n%s\nCompany info ingestion complete!\n%s", separator, separator)
+
 
 if __name__ == "__main__":
     main()

@@ -68,30 +68,93 @@ def query_df(ch, sql: str, cols: list) -> pd.DataFrame:
 
 # ─── Data loaders ─────────────────────────────────────────────
 
-def load_ticks_with_vwap(ch, symbol: str, minutes: int) -> pd.DataFrame:
-    """Tải ticks + tính running VWAP (session) qua window function."""
+def load_ohlc_with_vwap(ch, symbol: str, minutes: int) -> pd.DataFrame:
+    """Tải OHLCV (1 phút) + tính running VWAP (session) qua window function."""
+    # VWAP dùng typical price = (high+low+close)/3.
+    # Bands chuẩn: upper = vwap + k*sigma, lower = vwap - k*sigma.
     df = query_df(ch, f"""
         SELECT
-            received_at,
-            price,
-            quantity,
-            sum(price * quantity) OVER (ORDER BY received_at
-                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) /
-            sum(quantity) OVER (ORDER BY received_at
-                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS vwap
-        FROM trades_raw
-        WHERE symbol = '{symbol}'
-          AND toDate(received_at) = today()
-          AND received_at >= now() - INTERVAL {minutes} MINUTE
-        ORDER BY received_at ASC
+            candle_time AS time,
+            close AS price,
+            volume AS quantity,
+            vwap,
+            sigma
+        FROM
+        (
+            SELECT
+                candle_time,
+                close,
+                volume,
+                -- cumulative VWAP
+                (
+                    sum(((high + low + close) / 3.0) * volume)
+                        OVER (ORDER BY candle_time
+                            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+                    /
+                    nullIf(
+                        sum(volume) OVER (ORDER BY candle_time
+                            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+                        0
+                    )
+                ) AS vwap,
+                -- volume-weighted sigma of typical price:
+                -- variance = E[x^2] - (E[x])^2 with weights=volume
+                sqrt(greatest(
+                    (
+                        sum(
+                            (((high + low + close) / 3.0) * ((high + low + close) / 3.0)) * volume
+                        )
+                            OVER (ORDER BY candle_time
+                                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+                        /
+                        nullIf(
+                            sum(volume) OVER (ORDER BY candle_time
+                                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+                            0
+                        )
+                    )
+                    -
+                    (
+                        (
+                            sum(((high + low + close) / 3.0) * volume)
+                                OVER (ORDER BY candle_time
+                                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+                            /
+                            nullIf(
+                                sum(volume) OVER (ORDER BY candle_time
+                                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+                                0
+                            )
+                        )
+                        *
+                        (
+                            sum(((high + low + close) / 3.0) * volume)
+                                OVER (ORDER BY candle_time
+                                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+                            /
+                            nullIf(
+                                sum(volume) OVER (ORDER BY candle_time
+                                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+                                0
+                            )
+                        )
+                    ),
+                    0
+                )) AS sigma
+            FROM ohlc_raw
+            WHERE symbol = '{symbol}'
+              AND toDate(candle_time) = today()
+        ) t
+        WHERE time >= now() - INTERVAL {minutes} MINUTE
+        ORDER BY time ASC
         LIMIT 5000
-    """, ['time', 'price', 'quantity', 'vwap'])
+    """, ['time', 'price', 'quantity', 'vwap', 'sigma'])
     if not df.empty:
         df['time'] = pd.to_datetime(df['time'])
     return df
 
 
-def load_alerts(ch, limit: int = 20) -> pd.DataFrame:
+def load_alerts(ch, limit: int = 50) -> pd.DataFrame:
     return query_df(ch, f"""
         SELECT alert_time, symbol, alert_type, price, vwap, deviation_pct
         FROM alerts
@@ -101,18 +164,18 @@ def load_alerts(ch, limit: int = 20) -> pd.DataFrame:
 
 
 def load_summary(ch) -> dict:
-    ticks = ch.query("SELECT count() FROM trades_raw WHERE toDate(received_at) = today()").result_rows
+    candles = ch.query("SELECT count() FROM ohlc_raw WHERE toDate(candle_time) = today()").result_rows
     alts  = ch.query("SELECT count() FROM alerts WHERE toDate(alert_time) = today()").result_rows
     return {
-        'ticks': ticks[0][0] if ticks else 0,
+        'candles': candles[0][0] if candles else 0,
         'alerts': alts[0][0] if alts else 0,
     }
 
 
 def load_last_price(ch, symbol: str) -> float | None:
     rows = ch.query(
-        f"SELECT price FROM trades_raw WHERE symbol='{symbol}' "
-        f"ORDER BY received_at DESC LIMIT 1"
+        f"SELECT close FROM ohlc_raw WHERE symbol='{symbol}' "
+        f"ORDER BY candle_time DESC LIMIT 1"
     ).result_rows
     return rows[0][0] if rows else None
 
@@ -141,14 +204,21 @@ def build_chart(df: pd.DataFrame, symbol: str) -> go.Figure:
         x=df['time'], y=df['vwap'], mode='lines', name='Session VWAP',
         line=dict(color='#ffa800', width=2, dash='dash'),
     ))
-    # ±1.5% band
-    hi = df['vwap'] * 1.015
-    lo = df['vwap'] * 0.985
+
+    # Bands theo sigma multiplier (frontend dùng cố định k=2.0 cho UI; detector dùng k từ env)
+    k = float(os.getenv('BAND_SIGMA_MULTIPLIER', '2.0'))
+    if 'sigma' in df.columns:
+        hi = df['vwap'] + k * df['sigma']
+        lo = df['vwap'] - k * df['sigma']
+    else:
+        # fallback: nếu query cũ
+        hi = df['vwap'] * 1.015
+        lo = df['vwap'] * 0.985
     fig.add_trace(go.Scatter(
         x=pd.concat([df['time'], df['time'][::-1]]),
         y=pd.concat([hi, lo[::-1]]),
         fill='toself', fillcolor='rgba(255,168,0,0.07)',
-        line=dict(color='rgba(0,0,0,0)'), name='±1.5% Band',
+        line=dict(color='rgba(0,0,0,0)'), name=f'VWAP ±{k}σ Band',
     ))
 
     fig.update_layout(
@@ -185,6 +255,7 @@ def main():
         st.title('⚙️ Cài đặt')
         sym = st.selectbox('Mã chứng khoán', SYMBOLS)
         minutes = st.slider('Hiển thị (phút)', 5, 60, 30)
+        alert_limit = st.slider('Số cảnh báo hiển thị', 10, 100, 30, step=5)
         st.divider()
         st.caption(f'🔄 Tự làm mới mỗi {REFRESH_SEC}s')
         st.caption(f'🕐 {now_str} ICT')
@@ -198,28 +269,31 @@ def main():
     summary = load_summary(ch)
     last_price = load_last_price(ch, sym)
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric('📊 Tổng ticks hôm nay', f"{summary['ticks']:,}")
+    c1.metric('📊 Tổng candles hôm nay', f"{summary['candles']:,}")
     c2.metric('🚨 Alerts hôm nay', f"{summary['alerts']}")
     c3.metric(f'💰 Giá {sym}', f'{last_price:.2f}' if last_price else '—')
     c4.metric('⏱️ Cập nhật lúc', now_str)
 
     st.divider()
 
-    # Chart
-    df = load_ticks_with_vwap(ch, sym, minutes)
-    st.plotly_chart(build_chart(df, sym), width='stretch')
+    # Layout chính: trái = chart, phải = bảng cảnh báo
+    col_chart, col_alerts = st.columns([2, 1])
 
-    # Alert table
-    st.subheader('🚨 Cảnh báo gần nhất')
-    df_alerts = load_alerts(ch)
-    if df_alerts.empty:
-        st.info('Chưa có cảnh báo nào trong phiên.')
-    else:
-        df_alerts['dev_%'] = df_alerts['dev_%'].map(lambda x: f'{x:+.2f}%')
-        df_alerts['price'] = df_alerts['price'].map(lambda x: f'{x:.2f}')
-        df_alerts['vwap'] = df_alerts['vwap'].map(lambda x: f'{x:.2f}')
-        styled = df_alerts.style.map(style_alert_type, subset=['type'])
-        st.dataframe(styled, width='stretch', hide_index=True)
+    with col_chart:
+        df = load_ohlc_with_vwap(ch, sym, minutes)
+        st.plotly_chart(build_chart(df, sym), use_container_width=True)
+
+    with col_alerts:
+        st.subheader('🚨 Cảnh báo gần nhất')
+        df_alerts = load_alerts(ch, limit=alert_limit)
+        if df_alerts.empty:
+            st.info('Chưa có cảnh báo nào trong phiên.')
+        else:
+            df_alerts['dev_%'] = df_alerts['dev_%'].map(lambda x: f'{x:+.2f}%')
+            df_alerts['price'] = df_alerts['price'].map(lambda x: f'{x:.2f}')
+            df_alerts['vwap'] = df_alerts['vwap'].map(lambda x: f'{x:.2f}')
+            styled = df_alerts.style.map(style_alert_type, subset=['type'])
+            st.dataframe(styled, use_container_width=True, hide_index=True)
 
     # Auto refresh
     time.sleep(REFRESH_SEC)

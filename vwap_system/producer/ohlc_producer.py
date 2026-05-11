@@ -1,8 +1,8 @@
 """
-Trade Producer — DNSE WebSocket → Kafka
+OHLC Producer — DNSE WebSocket → Kafka
 
-Subscribe real-time trade ticks từ DNSE và publish lên Kafka topic.
-Chạy: uv run trade_producer.py
+Subscribe OHLCV (resolution ~ 1 minute) từ DNSE và publish lên Kafka topic.
+Chạy: uv run ohlc_producer.py
 """
 
 import asyncio
@@ -11,21 +11,25 @@ import logging
 import os
 import signal
 import sys
-from datetime import datetime, timezone, timedelta
+
+from datetime import datetime, timedelta, timezone
 
 # Thêm path đến trading_websocket SDK
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'dnse_sdk', 'trading_websocket'))
+sys.path.insert(
+    0, os.path.join(os.path.dirname(__file__), '..', '..', 'dnse_sdk', 'trading_websocket')
+)
 
 from kafka import KafkaProducer
 from trading_websocket import TradingClient
-from trading_websocket.models import Trade
+from trading_websocket.models import Ohlc
+
 from config import Config
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
 )
-logger = logging.getLogger('trade_producer')
+logger = logging.getLogger('ohlc_producer')
 
 ICT = timezone(timedelta(hours=7))
 
@@ -37,7 +41,7 @@ def create_kafka_producer(bootstrap_servers: str) -> KafkaProducer:
         acks='all',
         retries=5,
         retry_backoff_ms=500,
-        linger_ms=5,          # batch nhỏ để giảm latency
+        linger_ms=5,  # giảm latency
         batch_size=16384,
     )
 
@@ -57,24 +61,33 @@ async def run(config: Config) -> None:
 
     stats = {'sent': 0, 'errors': 0}
 
-    def handle_trade(trade: Trade) -> None:
+    def handle_ohlc(ohlc: Ohlc) -> None:
+        # "received_at" là thời điểm producer nhận message từ websocket.
         received_at = datetime.now(ICT).strftime('%Y-%m-%dT%H:%M:%S.%f')
         message = {
             'received_at': received_at,
-            'symbol': trade.symbol,
-            'price': float(trade.price),
-            'quantity': int(trade.quantity),
-            'total_volume': int(trade.totalVolumeTraded),
-            'board_id': int(trade.boardId),
-            'market_id': int(trade.marketId),
+            'symbol': ohlc.symbol,
+            'resolution': ohlc.resolution,
+            'open': float(ohlc.open),
+            'high': float(ohlc.high),
+            'low': float(ohlc.low),
+            'close': float(ohlc.close),
+            'volume': int(ohlc.volume),
+            # ClickHouse MV cần đúng tên field "type" vì kafka_ohlc table sẽ có cột `type`
+            'type': ohlc.type,
+            # DNSE: time là epoch seconds (ví dụ "1757992500")
+            'time': int(ohlc.time),
+            'lastUpdated': int(ohlc.lastUpdated),
         }
+
         try:
-            producer.send(config.KAFKA_TRADES_TOPIC, value=message)
+            producer.send(config.KAFKA_OHLC_TOPIC, value=message)
             stats['sent'] += 1
             if stats['sent'] % 200 == 0:
                 logger.info(
-                    f"[{trade.symbol}] price={trade.price:.2f} "
-                    f"qty={trade.quantity:,} | total_sent={stats['sent']:,}"
+                    f"[{ohlc.symbol}] {ohlc.resolution}m "
+                    f"close={ohlc.close:.2f} vol={ohlc.volume:,} "
+                    f"total_sent={stats['sent']:,}"
                 )
         except Exception as exc:
             stats['errors'] += 1
@@ -83,13 +96,14 @@ async def run(config: Config) -> None:
     await client.connect()
     logger.info(f"Connected to DNSE. Subscribing: {config.SYMBOLS}")
 
-    await client.subscribe_trades(
+    await client.subscribe_ohlc(
         symbols=config.SYMBOLS,
-        on_trade=handle_trade,
+        resolution=config.OHLC_RESOLUTION,
+        on_ohlc=handle_ohlc,
         encoding=config.DNSE_ENCODING,
     )
 
-    logger.info("Producer running — Ctrl+C để dừng")
+    logger.info("OHLC producer running — Ctrl+C để dừng")
 
     try:
         while True:
@@ -107,14 +121,6 @@ async def run(config: Config) -> None:
 
 
 def main() -> None:
-    # Tạm thời không dùng pipeline trade (tick).
-    # Bật nếu cần: ENABLE_TRADE_PIPELINE=1
-    if os.getenv('ENABLE_TRADE_PIPELINE', '0') != '1':
-        logger.warning(
-            "trade_producer is disabled by default. "
-            "Set ENABLE_TRADE_PIPELINE=1 to run."
-        )
-        return
     config = Config()
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -137,3 +143,4 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
+

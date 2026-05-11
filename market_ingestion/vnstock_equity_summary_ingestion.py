@@ -70,6 +70,18 @@ def _add_ingested_at(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _write_parquet_and_log(
+    df: pd.DataFrame,
+    fs: s3fs.S3FileSystem,
+    s3_path: str,
+    success_prefix: str = "Uploaded",
+) -> None:
+    with fs.open(s3_path, "wb") as fh:
+        df.to_parquet(fh, engine="pyarrow", index=False, compression="snappy")
+    size_kb = (fs.size(s3_path) or 0) / 1024
+    logger.info(f"{success_prefix} s3://{s3_path} ({size_kb:.1f} KB, {len(df):,} rows)")
+
+
 def write_parquet_to_s3(df: pd.DataFrame, fs: s3fs.S3FileSystem, s3_path: str) -> None:
     if df is None or df.empty:
         logger.warning(f"DataFrame is empty, skipping upload for {s3_path}")
@@ -78,11 +90,7 @@ def write_parquet_to_s3(df: pd.DataFrame, fs: s3fs.S3FileSystem, s3_path: str) -
         logger.info(f"Exists, skipping: s3://{s3_path}  (use --append to merge)")
         return
     df = _add_ingested_at(df)
-    with fs.open(s3_path, "wb") as f:
-        df.to_parquet(f, engine="pyarrow", index=False, compression="snappy")
-    file_size = fs.size(s3_path)
-    size_kb = file_size / 1024 if file_size is not None else 0
-    logger.info(f"✅ Uploaded s3://{s3_path} ({size_kb:.1f} KB, {len(df):,} rows)")
+    _write_parquet_and_log(df, fs, s3_path, success_prefix="Uploaded")
 
 
 def append_parquet_to_s3(
@@ -121,12 +129,7 @@ def append_parquet_to_s3(
     if before != after:
         logger.info(f"Dedup: {before - after:,} duplicate rows removed → {after:,} rows kept")
 
-    with fs.open(s3_path, "wb") as f:
-        df_combined.to_parquet(f, engine="pyarrow", index=False, compression="snappy")
-
-    file_size = fs.size(s3_path)
-    size_kb = file_size / 1024 if file_size is not None else 0
-    logger.info(f"✅ Appended → s3://{s3_path} ({size_kb:.1f} KB, {after:,} rows total)")
+    _write_parquet_and_log(df_combined, fs, s3_path, success_prefix="Appended ->")
 
 
 def read_symbols_from_equity_parquet(fs: s3fs.S3FileSystem, equity_s3_path: str) -> list[str]:
@@ -272,22 +275,32 @@ def parse_args():
     return p.parse_args()
 
 
+def log_run_info(args: argparse.Namespace, ref_prefix: str, market_prefix: str) -> None:
+    separator = "=" * 80
+    mode = "append" if args.append else "write (skip if exists)"
+    run_at = datetime.now(ICT).strftime("%Y-%m-%d %H:%M:%S %Z")
+    logger.info(
+        "\n%s\nFetch VNStock equity summary() to MinIO S3\n%s\n"
+        "MinIO Endpoint    : %s\n"
+        "Reference source  : s3://%s/equity/equity.parquet\n"
+        "Target output     : s3://%s/equity/summary.parquet\n"
+        "Mode              : %s\n"
+        "Run at            : %s\n%s",
+        separator, separator,
+        MINIO_ENDPOINT,
+        ref_prefix,
+        market_prefix,
+        mode,
+        run_at,
+        separator,
+    )
+
+
 def main():
     args = parse_args()
-
     ref_prefix = f"{args.bucket}/{args.ref_prefix}"
     market_prefix = f"{args.bucket}/{args.market_prefix}"
-    now = datetime.now(ICT)
-
-    print("=" * 80)
-    print("Fetch VNStock equity summary() to MinIO S3")
-    print("=" * 80)
-    print(f"MinIO Endpoint    : {MINIO_ENDPOINT}")
-    print(f"Reference source  : s3://{ref_prefix}/equity/equity.parquet")
-    print(f"Target output     : s3://{market_prefix}/equity/summary.parquet")
-    print(f"Mode              : {'append' if args.append else 'write (skip if exists)'}")
-    print(f"Run at            : {now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-    print("=" * 80)
+    log_run_info(args, ref_prefix, market_prefix)
 
     fs = s3fs.S3FileSystem(
         key=MINIO_ACCESS_KEY,
@@ -314,9 +327,8 @@ def main():
     else:
         write_parquet_to_s3(df_summary, fs, summary_s3_path)
 
-    print("\n" + "=" * 80)
-    logger.info("🎉 Equity summary ingestion complete!")
-    print("=" * 80)
+    separator = "=" * 80
+    logger.info("\n%s\nEquity summary ingestion complete!\n%s", separator, separator)
 
 
 if __name__ == "__main__":

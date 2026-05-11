@@ -2,19 +2,24 @@
 Market data subscription example.
 
 Demonstrates:
-- Subscribing to OHLCV updates
+- Subscribing to trade updates
 
 This example shows how to receive real-time market data for multiple symbols.
 """
 
 import asyncio
-from datetime import datetime
+import os
 
 from trading_websocket import TradingClient
-from trading_websocket.models import Ohlc
+from trading_websocket.models import Trade
 
 
 async def main():
+    # Tạm thời không dùng pipeline trade.
+    # Bật nếu cần: ENABLE_TRADE_EXAMPLES=1
+    if os.getenv('ENABLE_TRADE_EXAMPLES', '0') != '1':
+        print("trade_realtime.py disabled (set ENABLE_TRADE_EXAMPLES=1 to run).")
+        return
     # Initialize client
     encoding = "msgpack"  # json or msgpack
     client = TradingClient(
@@ -24,25 +29,16 @@ async def main():
         encoding=encoding,
     )
 
-    def handle_ohlc(ohlc: Ohlc):
-        # Ohlc model currently does not expose receivedAt; use time/lastUpdated.
-        ts = ohlc.lastUpdated or ohlc.time
-        received_at = datetime.fromtimestamp(ts).strftime("%H:%M:%S.%f")[:-3] if ts else "N/A"
-        print(f"[{received_at}] OHLC: {ohlc}")
+    def handle_trade(trade: Trade):
+        print(f"TRADE: {trade}")
 
     # Connect to gateway
     print("Connecting to WebSocket gateway...")
     await client.connect()
     print(f"Connected! Session ID: {client._session_id}\n")
 
-    print("Subscribing to ohlc for SSI...")
-    # internal 1 3 5 15 30 1H 1D 1W
-    await client.subscribe_ohlc(
-        ["SSI"],
-        resolution="1",
-        on_ohlc=handle_ohlc,
-        encoding=encoding,
-    )
+    print("Subscribing to trades for SSI...")
+    await client.subscribe_trades(["SSI"], on_trade=handle_trade, encoding=encoding, board_id="G1")
 
     print("\nReceiving market data (will run for 1 hour)...\n")
 
@@ -54,7 +50,6 @@ async def main():
     print("\n\nDisconnecting...")
     await client.disconnect()
     print("Disconnected!")
-
 
 if __name__ == "__main__":
     asyncio.run(main())
