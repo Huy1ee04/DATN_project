@@ -12,6 +12,7 @@
 
 CREATE DATABASE IF NOT EXISTS stock_data;
 
+/*
 -- ===========================
 -- Dimension
 -- ===========================
@@ -74,3 +75,4 @@ FROM s3(
     'minio_secret_key',
     'Parquet'
 );
+*/

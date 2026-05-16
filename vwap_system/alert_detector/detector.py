@@ -1,8 +1,8 @@
 """
-VWAP Alert Detector
+Multi-Signal Alert Detector
 
-Polls ClickHouse cho OHLCV nến mới (1 phút), cập nhật session VWAP state,
-và ghi cảnh báo vào bảng alerts khi giá lệch ngưỡng.
+Polls ClickHouse cho OHLCV nến mới (1 phút), cập nhật VWAP + candle buffer,
+chạy tất cả alert rules (VWAP, RSI, Volume Spike), ghi cảnh báo vào alerts_v2.
 Chạy: uv run detector.py
 """
 
@@ -14,7 +14,17 @@ from pathlib import Path
 import clickhouse_connect
 
 from vwap import VWAPCalculator, ICT
+from candle_buffer import CandleBuffer, Candle
+from models import Alert
 from config import Config
+
+# Cảnh báo đơn lẻ (tạm comment — dùng Combined rule thay thế)
+# from rules.vwap_rule import VWAPRule
+# from rules.rsi_rule import RSIRule
+# from rules.volume_spike_rule import VolumeSpikeRule
+
+# Cảnh báo kết hợp đa tín hiệu (≥ 2 chỉ số đồng thuận mới fire)
+from rules.combined_rule import CombinedSignalRule
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,6 +46,23 @@ class AlertDetector:
         )
         self._ensure_schema()
         self.calc = VWAPCalculator()
+        self.buffer = CandleBuffer(maxlen=config.CANDLE_BUFFER_SIZE)
+
+        # Đăng ký alert rules
+        # --- Cảnh báo đơn lẻ (tạm comment — dùng Combined rule) ---
+        # self.rules = [
+        #     VWAPRule(config, self.calc),
+        #     RSIRule(config),
+        #     VolumeSpikeRule(config),
+        # ]
+
+        # --- Cảnh báo kết hợp (chỉ fire khi ≥ 2 tín hiệu đồng thuận) ---
+        self.rules = [
+            CombinedSignalRule(config, self.calc),
+        ]
+        rule_names = [r.RULE_NAME for r in self.rules]
+        logger.info(f"Registered rules: {rule_names}")
+
         self._warm_up()
 
     def _ensure_schema(self) -> None:
@@ -50,6 +77,8 @@ class AlertDetector:
                 f"SELECT count() FROM system.tables WHERE database = '{db}' AND name = 'ohlc_raw'"
             ).result_rows
             if exists and exists[0][0] > 0:
+                # Kiểm tra thêm alerts_v2
+                self._ensure_alerts_v2()
                 return
         except Exception as exc:
             logger.error(f"Failed to check schema existence: {exc}", exc_info=True)
@@ -88,26 +117,67 @@ class AlertDetector:
                 logger.debug(f"Init stmt failed (ignored): {exc}")
 
         logger.info("ClickHouse schema ensured (init.sql executed).")
+        self._ensure_alerts_v2()
+
+    def _ensure_alerts_v2(self) -> None:
+        """Tạo bảng alerts_v2 nếu chưa tồn tại."""
+        try:
+            stmt = """
+            CREATE TABLE IF NOT EXISTS alerts_v2 (
+                alert_time      DateTime64(3, 'Asia/Ho_Chi_Minh'),
+                symbol          LowCardinality(String),
+                rule_name       LowCardinality(String),
+                alert_type      String,
+                severity        LowCardinality(String),
+                price           Float64,
+                indicator_value Float64,
+                threshold       Float64,
+                deviation_pct   Float64,
+                message         String
+            ) ENGINE = MergeTree()
+            ORDER BY (alert_time, symbol, rule_name)
+            TTL toDate(alert_time) + INTERVAL 90 DAY
+            """
+            if hasattr(self.ch, 'command'):
+                self.ch.command(stmt)
+            else:
+                self.ch.query(stmt)
+            logger.info("alerts_v2 table ensured.")
+        except Exception as exc:
+            logger.debug(f"alerts_v2 creation (ignored): {exc}")
 
     # ------------------------------------------------------------------
 
     def _warm_up(self) -> None:
-        """Nạp OHLCV hôm nay để VWAP có trạng thái ban đầu chính xác."""
-        logger.info("Warming up VWAP state with today's OHLCV candles...")
+        """Nạp OHLCV hôm nay để VWAP + buffer có trạng thái ban đầu chính xác.
+
+        Dùng argMax để lấy bản cập nhật mới nhất cho mỗi cây nến.
+        """
+        logger.info("Warming up VWAP + candle buffer with today's OHLCV candles...")
         today = datetime.now(ICT).strftime('%Y-%m-%d')
         symbols_sql = ','.join([f"'{s.strip()}'" for s in self.config.SYMBOLS])
+
+        # Lấy bản mới nhất của mỗi nến (deduplicate bằng argMax)
         rows = self.ch.query(
-            f"SELECT candle_time, symbol, high, low, close, volume "
+            f"SELECT "
+            f"  candle_time, "
+            f"  symbol, "
+            f"  argMax(open, received_at) AS open, "
+            f"  argMax(high, received_at) AS high, "
+            f"  argMax(low, received_at) AS low, "
+            f"  argMax(close, received_at) AS close, "
+            f"  argMax(volume, received_at) AS volume, "
+            f"  max(received_at) AS last_received "
             f"FROM ohlc_raw "
             f"WHERE toDate(candle_time) = '{today}' AND symbol IN ({symbols_sql}) "
+            f"GROUP BY candle_time, symbol "
             f"ORDER BY candle_time ASC"
         ).result_rows
 
-        last_seen_ts_by_symbol: dict[str, datetime] = {}
-        for ts, symbol, high, low, close, volume in rows:
-            # Deduplicate: cùng candle_time có thể được publish nhiều lần.
-            if last_seen_ts_by_symbol.get(symbol) == ts:
-                continue
+        # Watermark = received_at lớn nhất trong warm-up
+        self._last_received_at: dict[str, datetime] = {}
+
+        for ts, symbol, open_, high, low, close, volume, last_recv in rows:
             self.calc.update(
                 symbol=symbol,
                 high=float(high),
@@ -116,115 +186,157 @@ class AlertDetector:
                 volume=int(volume),
                 ts=ts,
             )
-            last_seen_ts_by_symbol[symbol] = ts
+            self.buffer.push(symbol, Candle(
+                ts=ts, open=float(open_), high=float(high),
+                low=float(low), close=float(close), volume=int(volume),
+            ))
+            self._last_received_at[symbol] = last_recv
 
-        # last candle_time theo từng symbol để không bị bỏ lỡ khi poll.
-        self._last_ts_by_symbol = {}
-        for ts, symbol, *_ in rows:
-            self._last_ts_by_symbol[symbol] = ts
+        for sym in self.config.SYMBOLS:
+            s = sym.strip()
+            logger.info(
+                f"  {s}: buffer={self.buffer.size(s)} candles, "
+                f"vwap={self.calc.get_session_vwap(s)}"
+            )
 
         logger.info(f"Warm-up done: {len(rows):,} candles loaded")
 
     def _fetch_new_ohlc(self, symbol: str):
-        last_ts = self._last_ts_by_symbol.get(symbol)
+        """Lấy nến mới từ ClickHouse.
+
+        Watermark dựa trên received_at (thời điểm nhận message),
+        argMax deduplicate lấy bản cập nhật mới nhất cho mỗi candle_time.
+        """
+        last_recv = self._last_received_at.get(symbol)
         today = datetime.now(ICT).strftime('%Y-%m-%d')
-        if last_ts:
+
+        if last_recv:
+            recv_str = last_recv.strftime('%Y-%m-%d %H:%M:%S.%f')
             where = (
                 f"symbol = '{symbol}' "
                 f"AND toDate(candle_time) = '{today}' "
-                f"AND candle_time > '{last_ts.strftime('%Y-%m-%d %H:%M:%S.%f')}'"
+                f"AND received_at > '{recv_str}'"
             )
         else:
             where = f"symbol = '{symbol}' AND toDate(candle_time) = '{today}'"
 
         return self.ch.query(
-            f"SELECT candle_time, symbol, high, low, close, volume "
+            f"SELECT "
+            f"  candle_time, symbol, "
+            f"  argMax(open, received_at) AS open, "
+            f"  argMax(high, received_at) AS high, "
+            f"  argMax(low, received_at) AS low, "
+            f"  argMax(close, received_at) AS close, "
+            f"  argMax(volume, received_at) AS volume, "
+            f"  max(received_at) AS last_received "
             f"FROM ohlc_raw WHERE {where} "
-            f"ORDER BY candle_time ASC LIMIT 5000"
+            f"GROUP BY candle_time, symbol "
+            f"ORDER BY candle_time ASC "
+            f"LIMIT 5000"
         ).result_rows
 
-    def _fire(
-        self,
-        symbol: str,
-        alert_type: str,
-        price: float,
-        vwap: float,
-        deviation_pct: float,
-        ts: datetime,
-    ) -> None:
+    def _fire_alert(self, alert: Alert) -> None:
+        """Ghi alert vào ClickHouse alerts_v2 + log."""
         logger.warning(
-            f"🚨 {alert_type} | {symbol} "
-            f"price={price:.2f} vwap={vwap:.2f} dev={deviation_pct:+.2f}%"
+            f"🚨 [{alert.rule_name}] {alert.alert_type} | {alert.symbol} "
+            f"price={alert.price:.2f} indicator={alert.indicator_value:.2f} "
+            f"severity={alert.severity} | {alert.message}"
         )
         self.ch.insert(
-            'alerts',
-            [[ts, symbol, alert_type, price, vwap, deviation_pct]],
+            'alerts_v2',
+            [[
+                alert.alert_time, alert.symbol, alert.rule_name,
+                alert.alert_type, alert.severity, alert.price,
+                alert.indicator_value, alert.threshold,
+                alert.deviation_pct, alert.message,
+            ]],
             column_names=[
-                'alert_time', 'symbol', 'alert_type', 'price',
-                'vwap', 'deviation_pct',
+                'alert_time', 'symbol', 'rule_name', 'alert_type',
+                'severity', 'price', 'indicator_value', 'threshold',
+                'deviation_pct', 'message',
             ],
         )
+        # Tương thích ngược: ghi vào bảng alerts cũ nếu là VWAP rule
+        if alert.rule_name == 'VWAP':
+            try:
+                self.ch.insert(
+                    'alerts',
+                    [[
+                        alert.alert_time, alert.symbol,
+                        alert.alert_type.replace('VWAP_', ''),
+                        alert.price, alert.indicator_value, alert.deviation_pct,
+                    ]],
+                    column_names=[
+                        'alert_time', 'symbol', 'alert_type',
+                        'price', 'vwap', 'deviation_pct',
+                    ],
+                )
+            except Exception:
+                pass  # alerts cũ không quan trọng nếu fail
 
-    def _check(self, symbol: str, price: float, ts: datetime) -> None:
-        s_vwap, s_sigma = self.calc.get_session_vwap_and_sigma(symbol, ts)
-        if not s_vwap or s_vwap <= 0:
-            return
+    def _process_candle(
+        self, symbol: str, ts: datetime,
+        open_: float, high: float, low: float,
+        close: float, volume: int,
+    ) -> None:
+        """Xử lý 1 nến mới: cập nhật VWAP + buffer + chạy tất cả rules."""
+        # Cập nhật VWAP
+        self.calc.update(
+            symbol=symbol, high=high, low=low,
+            close=close, volume=volume, ts=ts,
+        )
 
-        # deviation_pct vẫn lưu để dashboard không phải thay đổi nhiều.
-        deviation_pct = (price - s_vwap) / s_vwap * 100
+        # Đẩy vào candle buffer (cho RSI / Volume Spike)
+        self.buffer.push(symbol, Candle(
+            ts=ts, open=open_, high=high,
+            low=low, close=close, volume=volume,
+        ))
 
-        mode = getattr(self.config, 'ALERT_BAND_MODE', 'sigma')
-        if mode == 'pct':
-            threshold = self.config.ALERT_THRESHOLD_PCT
-            if deviation_pct > threshold:
-                self._fire(symbol, 'BREAKOUT_UP', price, s_vwap, deviation_pct, ts)
-            elif deviation_pct < -threshold:
-                self._fire(symbol, 'BREAKDOWN', price, s_vwap, deviation_pct, ts)
-            return
-
-        # mode = 'sigma' (bands chuẩn)
-        k = float(getattr(self.config, 'BAND_SIGMA_MULTIPLIER', 2.0))
-        if not s_sigma or s_sigma <= 0:
-            return
-
-        upper = s_vwap + k * s_sigma
-        lower = s_vwap - k * s_sigma
-        if price > upper:
-            self._fire(symbol, 'BREAKOUT_UP', price, s_vwap, deviation_pct, ts)
-        elif price < lower:
-            self._fire(symbol, 'BREAKDOWN', price, s_vwap, deviation_pct, ts)
+        # Chạy tất cả rules
+        for rule in self.rules:
+            try:
+                alert = rule.evaluate(symbol, close, ts, self.buffer)
+                if alert:
+                    self._fire_alert(alert)
+            except Exception as exc:
+                logger.error(
+                    f"Rule {rule.RULE_NAME} error for {symbol}: {exc}",
+                    exc_info=True,
+                )
 
     def run(self) -> None:
         logger.info(
-            f"Detector running | mode={self.config.ALERT_BAND_MODE} "
-            f"| pct_threshold=±{self.config.ALERT_THRESHOLD_PCT}% "
+            f"Detector running | rules={[r.RULE_NAME for r in self.rules]} "
+            f"| vwap_mode={self.config.ALERT_BAND_MODE} "
             f"| sigma_k={self.config.BAND_SIGMA_MULTIPLIER} "
+            f"| rsi_period={self.config.RSI_PERIOD} "
+            f"| vol_lookback={self.config.VOLUME_LOOKBACK} "
+            f"| cooldown={self.config.ALERT_COOLDOWN_SEC}s "
             f"| poll every {self.config.POLL_INTERVAL_SEC}s"
         )
         while True:
             try:
                 total_processed = 0
                 for symbol in self.config.SYMBOLS:
+                    symbol = symbol.strip()
                     candles = self._fetch_new_ohlc(symbol)
                     if not candles:
                         continue
 
-                    prev_ts: datetime | None = None
-                    for ts, sym, high, low, close, volume in candles:
-                        # Deduplicate theo candle_time.
-                        if prev_ts == ts:
-                            continue
-                        self.calc.update(
+                    for ts, sym, open_, high, low, close, volume, last_recv in candles:
+                        self._process_candle(
                             symbol=sym,
+                            ts=ts,
+                            open_=float(open_),
                             high=float(high),
                             low=float(low),
                             close=float(close),
                             volume=int(volume),
-                            ts=ts,
                         )
-                        self._check(sym, float(close), ts)
 
-                    self._last_ts_by_symbol[symbol] = prev_ts if prev_ts else candles[-1][0]
+                    # Cập nhật watermark = received_at lớn nhất trong batch
+                    last_recv_in_batch = candles[-1][7]  # cột last_received
+                    self._last_received_at[symbol] = last_recv_in_batch
                     total_processed += len(candles)
 
                 if total_processed:

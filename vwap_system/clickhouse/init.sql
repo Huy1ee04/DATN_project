@@ -150,3 +150,23 @@ CREATE TABLE IF NOT EXISTS vwap.alerts
 ENGINE = MergeTree()
 ORDER BY (alert_time, symbol)
 TTL toDate(alert_time) + INTERVAL 90 DAY;
+
+-- ---------------------------------------------------------------
+-- 8. alerts_v2: multi-signal alerts (VWAP, RSI, Volume Spike)
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS vwap.alerts_v2
+(
+    alert_time      DateTime64(3, 'Asia/Ho_Chi_Minh'),
+    symbol          LowCardinality(String),
+    rule_name       LowCardinality(String),    -- VWAP, RSI, VOLUME_SPIKE
+    alert_type      String,                    -- VWAP_BREAKOUT_UP, RSI_OVERBOUGHT, ...
+    severity        LowCardinality(String),    -- INFO, WARNING, CRITICAL
+    price           Float64,
+    indicator_value Float64,                   -- Giá trị chỉ báo lúc trigger
+    threshold       Float64,                   -- Ngưỡng đã dùng
+    deviation_pct   Float64,                   -- % lệch (tương thích cũ)
+    message         String                     -- Mô tả tiếng Việt
+)
+ENGINE = MergeTree()
+ORDER BY (alert_time, symbol, rule_name)
+TTL toDate(alert_time) + INTERVAL 90 DAY;

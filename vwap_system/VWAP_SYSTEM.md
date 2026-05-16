@@ -1,6 +1,6 @@
-# VWAP Alert System — Tài liệu module
+# Multi-Signal Alert System — Tài liệu module
 
-Hệ thống streaming theo dõi giá cổ phiếu thời gian thực, tính **Volume-Weighted Average Price (VWAP)** theo phiên, phát hiện breakout/breakdown và hiển thị cảnh báo trực tiếp trên dashboard Streamlit. Dữ liệu nguồn từ DNSE WebSocket API, trung chuyển qua Kafka, lưu trữ tại ClickHouse.
+Hệ thống streaming theo dõi giá cổ phiếu Việt Nam thời gian thực, phân tích **3 chỉ báo kỹ thuật** (VWAP, RSI, Volume), và phát cảnh báo kết hợp khi ≥ 2 tín hiệu đồng thuận. Dữ liệu nguồn từ DNSE WebSocket API, trung chuyển qua Kafka, lưu trữ và phân tích tại ClickHouse, hiển thị trên Streamlit dashboard.
 
 ---
 
@@ -10,11 +10,12 @@ Hệ thống streaming theo dõi giá cổ phiếu thời gian thực, tính **V
 2. [Cấu trúc thư mục](#2-cấu-trúc-thư-mục)
 3. [Luồng dữ liệu](#3-luồng-dữ-liệu)
 4. [Thành phần chi tiết](#4-thành-phần-chi-tiết)
-5. [Schema ClickHouse](#5-schema-clickhouse)
-6. [Cấu hình (.env)](#6-cấu-hình-env)
-7. [Docker Compose](#7-docker-compose)
-8. [Khởi chạy](#8-khởi-chạy)
-9. [Lưu ý bảo mật](#9-lưu-ý-bảo-mật)
+5. [3 chỉ báo kỹ thuật](#5-ba-chỉ-báo-kỹ-thuật)
+6. [Combined Signal Rule](#6-combined-signal-rule)
+7. [Schema ClickHouse](#7-schema-clickhouse)
+8. [Cấu hình (.env)](#8-cấu-hình-env)
+9. [Khởi chạy](#9-khởi-chạy)
+10. [Kiểm tra & Debug](#10-kiểm-tra--debug)
 
 ---
 
@@ -22,13 +23,13 @@ Hệ thống streaming theo dõi giá cổ phiếu thời gian thực, tính **V
 
 | | |
 |---|---|
-| **Nguồn dữ liệu** | DNSE WebSocket API (OHLC candles + tick giao dịch) |
-| **Message broker** | Apache Kafka (2 topics) |
-| **Lưu trữ** | ClickHouse (database `vwap`, 3 bảng MergeTree) |
-| **Phát hiện cảnh báo** | Session VWAP ± sigma bands hoặc % threshold |
-| **Giao diện** | Streamlit dashboard (auto-refresh) |
-| **Backup** | Parquet → MinIO (hàng ngày) |
-| **TTL dữ liệu** | 90 ngày trên tất cả bảng raw |
+| **Nguồn dữ liệu** | DNSE WebSocket API (OHLC candles 1 phút) |
+| **Message broker** | Apache Kafka (topic `dnse.ohlc`) |
+| **Lưu trữ / Phân tích** | ClickHouse (database `vwap`) |
+| **Chỉ báo** | VWAP ± σ bands, RSI(14), Volume Spike |
+| **Cảnh báo** | Combined Signal Rule — ≥ 2 tín hiệu đồng thuận |
+| **Giao diện** | Streamlit dashboard (3-panel chart + alert feed) |
+| **Backup** | Parquet → MinIO (thủ công/lập lịch) |
 
 ---
 
@@ -36,23 +37,38 @@ Hệ thống streaming theo dõi giá cổ phiếu thời gian thực, tính **V
 
 ```
 vwap_system/
-├── .env.example                  # Template cấu hình môi trường
-├── clickhouse/
-│   └── init.sql                  # DDL schema ClickHouse (tự chạy khi container khởi động)
-├── producer/
-│   ├── config.py                 # Đọc .env, expose cấu hình Kafka + DNSE
-│   ├── ohlc_producer.py          # DNSE WS → Kafka topic dnse.ohlc  [mặc định BẬT]
-│   └── trade_producer.py         # DNSE WS → Kafka topic dnse.trades [mặc định TẮT]
-├── alert_detector/
-│   ├── config.py                 # Đọc .env, expose cấu hình ClickHouse + alert
-│   ├── vwap.py                   # VWAPCalculator: tính session VWAP + sigma bands
-│   └── detector.py               # AlertDetector: poll CH → tính VWAP → INSERT alerts
-├── dashboard/
-│   └── app.py                    # Streamlit UI: biểu đồ giá/VWAP/bands + bảng cảnh báo
-├── backup/
-│   └── minio_exporter.py         # Export trades_raw + alerts → Parquet → MinIO
-├── trade_realtime.py             # Demo subscribe tick (chứa hardcoded credentials)
-└── trade_realtime_template.py    # Demo subscribe OHLC (chứa hardcoded credentials)
+├── producer/                          ── THU DỮ LIỆU ──
+│   ├── config.py                      Cấu hình DNSE WS + Kafka
+│   ├── ohlc_producer.py               DNSE WebSocket → Kafka (nến 1 phút)
+│   └── trade_producer.py              DNSE WebSocket → Kafka (tick, tắt mặc định)
+│
+├── alert_detector/                    ── XỬ LÝ & CẢNH BÁO ──
+│   ├── config.py                      Cấu hình ClickHouse + tham số rules
+│   ├── detector.py                    Orchestrator: poll CH → chạy rules → ghi alerts
+│   ├── models.py                      Alert dataclass + Severity enums
+│   ├── candle_buffer.py               Deque lưu 50 nến gần nhất / symbol
+│   ├── vwap.py                        VWAP Calculator (session-based)
+│   ├── indicators/                    Hàm tính toán thuần túy (stateless)
+│   │   ├── rsi.py                     compute_rsi(closes, period) → float
+│   │   └── volume.py                  compute_volume_ratio(volumes, lookback) → float
+│   └── rules/                         Plugin cảnh báo (stateful, có cooldown)
+│       ├── base.py                    BaseAlertRule abstract class
+│       ├── combined_rule.py           ★ CombinedSignalRule (rule chính đang dùng)
+│       ├── vwap_rule.py               VWAP rule đơn lẻ (tạm comment)
+│       ├── rsi_rule.py                RSI rule đơn lẻ (tạm comment)
+│       └── volume_spike_rule.py       Volume rule đơn lẻ (tạm comment)
+│
+├── dashboard/                         ── HIỂN THỊ ──
+│   └── app.py                         Streamlit: 3-panel chart + bảng alerts
+│
+├── clickhouse/                        ── SCHEMA DATABASE ──
+│   └── init.sql                       DDL: ohlc_raw, trades_raw, alerts, alerts_v2
+│
+├── backup/                            ── LƯU TRỮ DÀI HẠN ──
+│   └── minio_exporter.py              ClickHouse → Parquet → MinIO
+│
+├── .env.example                       Template cấu hình (copy thành .env)
+└── VWAP_SYSTEM.md                     Tài liệu này
 ```
 
 ---
@@ -60,338 +76,346 @@ vwap_system/
 ## 3. Luồng dữ liệu
 
 ```
-                        ┌─────────────────────────────────────────────────────┐
-                        │                   DNSE WebSocket                    │
-                        └──────────────┬──────────────────┬───────────────────┘
-                                       │                  │ (ENABLE_TRADE_PIPELINE=1)
-                                       ▼                  ▼
-                              ohlc_producer        trade_producer *
-                                       │                  │
-                                       ▼                  ▼
-                             Kafka: dnse.ohlc    Kafka: dnse.trades
-                                       │                  │
-                          [Kafka Engine + MV]  [Kafka Engine + MV]
-                                       │                  │
-                                       ▼                  ▼
-                                   ohlc_raw          trades_raw
-                                  (MergeTree)        (MergeTree)
-                                       │                  │
-                              ┌────────┤                  ├──────────┐
-                              │        │                  │          │
-                              ▼        ▼                  ▼          ▼
-                          Dashboard  alert_detector    MinIO Backup
-                         (Streamlit)      │
-                              ▲          ▼
-                              │       alerts
-                              │      (MergeTree)
-                              └──────────┘
+DNSE WebSocket
+      │
+      │ subscribe OHLC (nến 1 phút, 5 mã cổ phiếu)
+      ▼
+┌─────────────────┐      JSON       ┌──────────────┐
+│ ohlc_producer.py │ ──────────────→ │ Kafka        │
+│ (async, msgpack) │                 │ topic:       │
+└─────────────────┘                 │ dnse.ohlc    │
+                                     └──────┬───────┘
+                                            │ Kafka Engine
+                                            │ (auto-consume)
+                                            ▼
+                                     ┌──────────────┐
+                                     │ ClickHouse    │
+                                     │ ohlc_raw      │
+                                     └──────┬───────┘
+                                            │ poll mỗi 10s
+                              ┌─────────────┴─────────────┐
+                              ▼                           ▼
+                       ┌─────────────┐            ┌─────────────┐
+                       │ detector.py │            │ dashboard   │
+                       │             │            │ app.py      │
+                       │ ┌─────────┐ │            │             │
+                       │ │VWAP Calc│ │            │ Price+VWAP  │
+                       │ │Buffer   │ │            │ RSI chart   │
+                       │ │Combined │ │            │ Volume bars │
+                       │ │ Rule    │ │            │ Alert table │
+                       │ └────┬────┘ │            └─────────────┘
+                       │      │      │
+                       │      ▼      │
+                       │  alerts_v2  │
+                       └─────────────┘
 ```
 
-**Pipeline chính (OHLC):** DNSE WS → `ohlc_producer` → Kafka `dnse.ohlc` → ClickHouse Kafka Engine → Materialized View → `ohlc_raw` → `alert_detector` → `alerts`
-
-**Pipeline tick (tuỳ chọn):** DNSE WS → `trade_producer` → Kafka `dnse.trades` → ClickHouse Kafka Engine → Materialized View → `trades_raw`
-
-**Consumers đọc:** `Dashboard` đọc `ohlc_raw` + `alerts`; `MinIO Exporter` đọc `trades_raw` + `alerts`.
-
-> `*` trade_producer và toàn bộ pipeline tick chỉ hoạt động khi `ENABLE_TRADE_PIPELINE=1`.
+**Điểm quan trọng:** ClickHouse Kafka Engine hoạt động như consumer tự động — không cần viết code consumer. ClickHouse tự poll Kafka, parse JSON, insert vào bảng MergeTree qua Materialized View.
 
 ---
 
 ## 4. Thành phần chi tiết
 
-### 4.1 `producer/ohlc_producer.py` — OHLC Producer
+### 4.1 Producer (`producer/ohlc_producer.py`)
 
-- Khởi tạo DNSE `TradingClient` với credentials từ `.env`.
-- Subscribe OHLC candles (`subscribe_ohlc`) cho từng symbol trong danh sách `SYMBOLS`.
-- Serialize message thành JSON, publish lên Kafka topic `KAFKA_OHLC_TOPIC` (`dnse.ohlc`).
-- **Chạy mặc định**, không cần flag đặc biệt.
+- Kết nối DNSE WebSocket qua SDK `TradingClient` (async, encoding msgpack)
+- Subscribe nến OHLC resolution 1 phút cho danh sách `SYMBOLS`
+- Serialize message → JSON → publish lên Kafka topic `dnse.ohlc`
+- Auto-reconnect (tối đa 10 lần), graceful shutdown (SIGINT/SIGTERM)
+- Heartbeat log mỗi 60 giây
 
-### 4.2 `producer/trade_producer.py` — Trade Producer _(tuỳ chọn)_
+### 4.2 Detector (`alert_detector/detector.py`)
 
-- Subscribe tick giao dịch (`subscribe_trade`) từ DNSE WebSocket.
-- Publish JSON lên Kafka topic `KAFKA_TOPIC` (`dnse.trades`).
-- **Tắt mặc định** — chỉ chạy khi `ENABLE_TRADE_PIPELINE=1` (early-exit guard trong `main()`).
-
-### 4.3 `alert_detector/vwap.py` — VWAPCalculator
-
-Tính **session VWAP** theo công thức:
+Orchestrator chính — vòng đời hoạt động:
 
 ```
-VWAP = Σ(typical_price × volume) / Σvolume
+__init__()
+  ├── Kết nối ClickHouse
+  ├── _ensure_schema()     ← tạo bảng nếu chưa có (idempotent)
+  ├── _ensure_alerts_v2()  ← tạo bảng alerts_v2 cho multi-signal
+  ├── CandleBuffer(50)     ← khởi tạo buffer rỗng
+  ├── CombinedSignalRule() ← đăng ký rule kết hợp
+  └── _warm_up()           ← load toàn bộ nến hôm nay từ CH
+                              → khôi phục VWAP state + buffer
 
-typical_price = (High + Low + Close) / 3
+run() — vòng lặp chính
+  └── Mỗi 10 giây (POLL_INTERVAL_SEC):
+      ├── Với mỗi symbol:
+      │   ├── _fetch_new_ohlc()   → query nến mới hơn watermark
+      │   └── _process_candle()   → cập nhật VWAP + buffer + chạy rules
+      │       ├── calc.update()      → cập nhật running VWAP
+      │       ├── buffer.push()      → đẩy nến vào deque
+      │       └── rule.evaluate()    → kiểm tra tổ hợp tín hiệu
+      │           └── nếu có alert → _fire_alert() → INSERT alerts_v2
+      └── cleanup_old_anchors()   → xóa VWAP state cũ
 ```
 
-- Khung giờ giao dịch: **09:00 – 14:45 ICT** (Asia/Ho_Chi_Minh).
-- Duy trì **volume-weighted sigma** (σ) để tính upper/lower bands.
-- Reset VWAP về 0 đầu mỗi phiên giao dịch.
+### 4.3 Candle Buffer (`candle_buffer.py`)
 
-### 4.4 `alert_detector/detector.py` — AlertDetector
+- `collections.deque` với `maxlen=50` cho mỗi symbol
+- Lưu 50 nến gần nhất (OHLCV + timestamp)
+- Cung cấp `get_closes(symbol, n)` cho RSI và `get_volumes(symbol, n)` cho Volume
+- Nến cũ nhất tự động bị loại khi buffer đầy
 
-Vòng lặp chính:
+### 4.4 VWAP Calculator (`vwap.py`)
 
-1. **Warm-up**: load toàn bộ candles trong ngày hôm nay từ `ohlc_raw` vào `VWAPCalculator`.
-2. **Poll loop** mỗi `POLL_INTERVAL_SEC` giây:
-   - Query `ohlc_raw` lấy các candle mới hơn watermark.
-   - Cập nhật `VWAPCalculator` cho từng symbol.
-   - So sánh giá với VWAP band:
-     - **`pct` mode**: `|price − vwap| / vwap > ALERT_THRESHOLD_PCT%`
-     - **`sigma` mode**: `price > vwap + k×σ` hoặc `price < vwap − k×σ`
-   - INSERT cảnh báo `BREAKOUT_UP` / `BREAKDOWN` vào bảng `alerts`.
+- Tính Session VWAP theo phiên giao dịch (9:00 – 14:45 ICT)
+- Công thức: `VWAP = Σ(typical_price × volume) / Σ(volume)`
+- `typical_price = (high + low + close) / 3`
+- Tính σ (volume-weighted standard deviation) cho bands
+- Reset mỗi đầu ngày mới (session-based)
 
-### 4.5 `dashboard/app.py` — Streamlit Dashboard
+### 4.5 Dashboard (`dashboard/app.py`)
 
-- Kết nối ClickHouse qua HTTP interface.
-- Tính VWAP + σ-bands bằng **SQL window functions** trên `ohlc_raw`.
-- Hiển thị biểu đồ **Plotly**: đường giá đóng cửa, đường VWAP, upper/lower bands.
-- Bảng cảnh báo gần nhất từ `alerts`.
-- **Auto-refresh** mỗi `DASHBOARD_REFRESH_SEC` giây (mặc định 5s).
+Streamlit web app với 3 panel:
 
-### 4.6 `backup/minio_exporter.py` — MinIO Exporter
+| Panel | Nội dung |
+|-------|----------|
+| **Panel 1** (55%) | Biểu đồ giá (Price line) + đường VWAP (dash) + σ-bands (filled area) |
+| **Panel 2** (20%) | RSI(14) với đường 70 (quá mua, đỏ) và 30 (quá bán, xanh) |
+| **Panel 3** (25%) | Volume bars — cột đỏ khi spike ≥ 3x trung bình, đường Vol Avg(20) |
 
-- Nhận ngày cần export qua CLI arg (mặc định = hôm nay theo ICT).
-- Query `trades_raw` và `alerts` theo ngày.
-- Ghi Parquet (Snappy compress) lên MinIO:
-  - `trades/date=YYYY-MM-DD/data.parquet`
-  - `alerts/date=YYYY-MM-DD/data.parquet`
+Sidebar: chọn mã, thời gian hiển thị, lọc alert theo rule/severity.
+Metrics row: Candles hôm nay, Alerts hôm nay, Giá hiện tại, RSI, Volume ratio, VWAP.
 
 ---
 
-## 5. Schema ClickHouse
+## 5. Ba chỉ báo kỹ thuật
 
-Database: **`vwap`** — khởi tạo tự động qua `clickhouse/init.sql` khi container lần đầu start.
+### 5.1 VWAP — Volume-Weighted Average Price
 
-### Bảng lưu trữ (MergeTree)
+**Câu hỏi:** Giá hiện tại ở đâu so với giá trị hợp lý trong phiên?
 
-#### `vwap.trades_raw`
-```sql
-CREATE TABLE vwap.trades_raw (
-    received_at  DateTime64(3, 'Asia/Ho_Chi_Minh'),
-    symbol       LowCardinality(String),
-    price        Float64,
-    quantity     Int64,
-    total_volume Int64,
-    board_id     Int16,
-    market_id    Int16
-) ENGINE = MergeTree()
-PARTITION BY toDate(received_at)
-ORDER BY (symbol, received_at)
-TTL toDate(received_at) + INTERVAL 90 DAY;
+```
+VWAP  = Σ(typical_price × volume) / Σ(volume)
+σ     = √(Σ(tp² × vol) / Σ(vol) − VWAP²)
+upper = VWAP + k × σ     (mặc định k=2.0)
+lower = VWAP − k × σ
 ```
 
-#### `vwap.ohlc_raw`
-```sql
-CREATE TABLE vwap.ohlc_raw (
-    received_at  DateTime64(3, 'Asia/Ho_Chi_Minh'),
-    candle_time  DateTime64(3, 'Asia/Ho_Chi_Minh'),
-    symbol       LowCardinality(String),
-    resolution   String,
-    market_type  String,
-    open         Float64,
-    high         Float64,
-    low          Float64,
-    close        Float64,
-    volume       Int64,
-    lastUpdated  Int64
-) ENGINE = MergeTree()
-PARTITION BY toDate(candle_time)
-ORDER BY (symbol, candle_time)
-TTL toDate(received_at) + INTERVAL 90 DAY;
+- Giá > upper → **Breakout** (giá cao bất thường so với phiên)
+- Giá < lower → **Breakdown** (giá thấp bất thường)
+- Tính bằng running sum (O(1) mỗi nến, không cần lưu toàn bộ lịch sử)
+
+### 5.2 RSI — Relative Strength Index
+
+**Câu hỏi:** Đà tăng/giảm còn bền vững không?
+
+```
+RSI = 100 − 100 / (1 + RS)
+RS  = avg_gain(14) / avg_loss(14)
 ```
 
-#### `vwap.alerts`
+- RSI > 70 → **Quá mua** (momentum cạn kiệt, rủi ro giảm)
+- RSI < 30 → **Quá bán** (có thể đảo chiều tăng)
+- Cần ít nhất 15 nến close để tính (period + 1)
+
+### 5.3 Volume Spike — Khối lượng đột biến
+
+**Câu hỏi:** Có "big money" đang hoạt động bất thường?
+
+```
+volume_ratio = current_volume / avg(volume, 20 nến trước)
+```
+
+- Ratio ≥ 3.0 → **Spike** (khối lượng gấp 3 trung bình)
+- Cần ít nhất 21 nến volume (lookback + 1)
+
+---
+
+## 6. Combined Signal Rule
+
+**Đây là rule chính đang hoạt động.** Thay vì 3 rule chạy rời rạc, CombinedSignalRule kiểm tra tổ hợp cả 3 chỉ báo và chỉ phát cảnh báo khi ≥ 2 tín hiệu đồng thuận.
+
+### Bảng ma trận cảnh báo
+
+| VWAP | RSI | Volume | Alert Type | Severity | Ý nghĩa |
+|------|-----|--------|------------|----------|---------|
+| Breakout ↑ | > 70 | Spike ≥ 3x | `COMBINED_PUMP_RISK` | **CRITICAL** | ⚠️ Rủi ro đẩy giá — cả 3 tín hiệu đều cực đoan |
+| Breakdown ↓ | < 30 | Spike ≥ 3x | `COMBINED_PANIC_SELL` | **CRITICAL** | 🔴 Bán tháo — panic selling |
+| Breakout ↑ | > 70 | Bình thường | `COMBINED_OVERBOUGHT_BREAKOUT` | WARNING | Breakout + quá mua — cẩn trọng |
+| Breakdown ↓ | < 30 | Bình thường | `COMBINED_OVERSOLD_BREAKDOWN` | WARNING | Breakdown + quá bán — có thể là cơ hội |
+| Trong band | 30-70 | Spike ≥ 3x | `COMBINED_UNUSUAL_VOLUME` | WARNING | 🟠 KL bất thường — đang có tin? |
+| Breakout/Down | 30-70 | Spike ≥ 3x | `COMBINED_VOLUME_BREAKOUT/BREAKDOWN` | WARNING | Giá lệch VWAP + KL lớn |
+
+### Cooldown
+
+Mỗi alert type có cooldown **5 phút** (mặc định) cho mỗi symbol:
+- HPG báo `COMBINED_PUMP_RISK` lúc 10:00 → không báo lại cho HPG đến 10:05
+- SSI vẫn có thể báo độc lập (cooldown theo từng symbol)
+
+### Tại sao dùng Combined thay vì 3 rule riêng?
+
+| | 3 Rule riêng | Combined Rule |
+|---|---|---|
+| Số alert | Nhiều, dễ spam | Ít, chất lượng cao |
+| False alarm | Cao | Thấp (cần ≥ 2 đồng thuận) |
+| Ý nghĩa | Phải tự ghép | Máy kết luận sẵn |
+
+---
+
+## 7. Schema ClickHouse
+
+Database: `vwap`
+
+| Bảng | Engine | TTL | Mục đích |
+|------|--------|-----|----------|
+| `ohlc_raw` | MergeTree | 90 ngày | Nến OHLCV 1 phút (từ Kafka) |
+| `kafka_ohlc` | Kafka | — | Cổng nhận message Kafka |
+| `kafka_to_ohlc_raw` | MV | — | Tự động parse + insert |
+| `trades_raw` | MergeTree | 90 ngày | Tick giao dịch (tắt mặc định) |
+| `kafka_trades` | Kafka | — | Cổng nhận trades |
+| `kafka_to_trades_raw` | MV | — | Tự động parse + insert |
+| `alerts` | MergeTree | 90 ngày | Alerts cũ (chỉ VWAP, tương thích ngược) |
+| **`alerts_v2`** | MergeTree | 90 ngày | **Alerts mới** — multi-signal |
+
+### Schema `alerts_v2`
+
 ```sql
-CREATE TABLE vwap.alerts (
-    alert_time    DateTime64(3, 'Asia/Ho_Chi_Minh'),
-    symbol        LowCardinality(String),
-    alert_type    String,        -- BREAKOUT_UP | BREAKDOWN
-    price         Float64,
-    vwap          Float64,
-    deviation_pct Float64
+CREATE TABLE vwap.alerts_v2 (
+    alert_time      DateTime64(3, 'Asia/Ho_Chi_Minh'),
+    symbol          LowCardinality(String),
+    rule_name       LowCardinality(String),    -- COMBINED
+    alert_type      String,                    -- COMBINED_PUMP_RISK, ...
+    severity        LowCardinality(String),    -- WARNING, CRITICAL
+    price           Float64,
+    indicator_value Float64,                   -- RSI hoặc volume ratio
+    threshold       Float64,
+    deviation_pct   Float64,                   -- % lệch giá vs VWAP
+    message         String                     -- Mô tả tiếng Việt
 ) ENGINE = MergeTree()
-ORDER BY (alert_time, symbol)
+ORDER BY (alert_time, symbol, rule_name)
 TTL toDate(alert_time) + INTERVAL 90 DAY;
 ```
 
-### Kafka Engines (cổng nhận dữ liệu từ Kafka)
+---
 
-| Bảng | Topic | Consumer Group |
-|------|-------|----------------|
-| `kafka_trades` | `dnse.trades` | `clickhouse_vwap_consumer` |
-| `kafka_ohlc` | `dnse.ohlc` | `clickhouse_vwap_consumer_ohlc` |
+## 8. Cấu hình (.env)
 
-Broker (bên trong Docker): `kafka:29092`
+File `.env` đặt ở **thư mục gốc repo** (`DATN_project/.env`). Template: `vwap_system/.env.example`.
 
-### Materialized Views (chuyển dữ liệu tự động)
+### Các biến quan trọng
 
-| View | Từ | Đến | Xử lý |
-|------|-----|-----|-------|
-| `kafka_to_trades_raw` | `kafka_trades` | `trades_raw` | Parse ISO timestamp → DateTime64 |
-| `kafka_to_ohlc_raw` | `kafka_ohlc` | `ohlc_raw` | Convert Unix epoch → DateTime64, map `type` → `market_type` |
+| Nhóm | Biến | Mặc định | Mô tả |
+|------|------|----------|-------|
+| **DNSE** | `DNSE_API_KEY` | *(bắt buộc)* | API key từ DNSE Open API |
+| | `DNSE_API_SECRET` | *(bắt buộc)* | API secret |
+| **Kafka** | `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Kafka broker |
+| **ClickHouse** | `CLICKHOUSE_HOST` | `localhost` | ClickHouse host |
+| | `CLICKHOUSE_HTTP_PORT` | `8123` | HTTP port |
+| **VWAP** | `ALERT_BAND_MODE` | `sigma` | `sigma` hoặc `pct` |
+| | `BAND_SIGMA_MULTIPLIER` | `2.0` | Hệ số k cho bands |
+| **RSI** | `RSI_PERIOD` | `14` | Chu kỳ RSI |
+| | `RSI_OVERBOUGHT` | `70` | Ngưỡng quá mua |
+| | `RSI_OVERSOLD` | `30` | Ngưỡng quá bán |
+| **Volume** | `VOLUME_LOOKBACK` | `20` | Số nến tính trung bình |
+| | `VOLUME_SPIKE_RATIO` | `3.0` | Ngưỡng spike |
+| **Runtime** | `POLL_INTERVAL_SEC` | `10` | Chu kỳ poll ClickHouse |
+| | `ALERT_COOLDOWN_SEC` | `300` | Cooldown giữa alerts (giây) |
+| | `CANDLE_BUFFER_SIZE` | `50` | Số nến giữ trong buffer |
+| | `SYMBOLS` | `HPG,SSI,VNM,VCB,TCB` | Danh sách mã theo dõi |
 
 ---
 
-## 6. Cấu hình (.env)
+## 9. Khởi chạy
 
-Copy template và điền giá trị thực:
+### Yêu cầu
+- Docker + Docker Compose
+- Python 3.11+
+- uv (package manager)
+- Tài khoản DNSE Open API (có API key/secret)
 
-```bash
-cp vwap_system/.env.example .env
-```
-
-> Tất cả service đọc `.env` từ **thư mục gốc của repo** (không phải trong `vwap_system/`).
-
-### DNSE API
-
-| Biến | Mặc định | Mô tả |
-|------|----------|-------|
-| `DNSE_API_KEY` | _(bắt buộc)_ | API key xác thực DNSE |
-| `DNSE_API_SECRET` | _(bắt buộc)_ | API secret xác thực DNSE |
-| `DNSE_WS_URL` | `wss://ws-openapi.dnse.com.vn` | WebSocket endpoint của DNSE Open API |
-| `DNSE_ENCODING` | `msgpack` | Định dạng encoding frame WebSocket |
-
-### Kafka
-
-| Biến | Mặc định | Mô tả |
-|------|----------|-------|
-| `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Broker address. Từ host dùng `:9092`; trong Docker dùng `kafka:29092` |
-| `KAFKA_TOPIC` | `dnse.trades` | Topic cho tick giao dịch |
-| `KAFKA_OHLC_TOPIC` | `dnse.ohlc` | Topic cho nến OHLC |
-
-### ClickHouse
-
-| Biến | Mặc định | Mô tả |
-|------|----------|-------|
-| `CLICKHOUSE_HOST` | `localhost` | Host ClickHouse HTTP interface |
-| `CLICKHOUSE_HTTP_PORT` | `8123` | Port HTTP interface |
-| `CLICKHOUSE_USER` | `default` | User ClickHouse |
-| `CLICKHOUSE_PASSWORD` | `default` | Password ClickHouse |
-| `CLICKHOUSE_DB` | `vwap` | Database |
-
-### MinIO
-
-| Biến | Mặc định | Mô tả |
-|------|----------|-------|
-| `MINIO_ENDPOINT` | `localhost:9100` | MinIO endpoint |
-| `MINIO_ACCESS_KEY` | `minio_access_key` | Access key |
-| `MINIO_SECRET_KEY` | `minio_secret_key` | Secret key |
-| `MINIO_BUCKET` | `stock-data` | Bucket đích cho backup |
-
-### Alert & Runtime
-
-| Biến | Mặc định | Mô tả |
-|------|----------|-------|
-| `SYMBOLS` | `HPG,SSI,VNM,VCB,TCB` | Danh sách mã cổ phiếu theo dõi (phân cách dấu phẩy) |
-| `OHLC_RESOLUTION` | `1` | Độ phân giải nến (phút) |
-| `ALERT_BAND_MODE` | `sigma` | `pct` = % lệch khỏi VWAP \| `sigma` = ± k × σ |
-| `ALERT_THRESHOLD_PCT` | `1.5` | Ngưỡng % khi `ALERT_BAND_MODE=pct` |
-| `BAND_SIGMA_MULTIPLIER` | `2.0` | Hệ số k khi `ALERT_BAND_MODE=sigma` |
-| `POLL_INTERVAL_SEC` | `10` | Chu kỳ poll `ohlc_raw` của detector (giây) |
-| `ENABLE_TRADE_PIPELINE` | `0` | Đặt `=1` để bật pipeline tick giao dịch |
-| `DASHBOARD_REFRESH_SEC` | `5` | Chu kỳ auto-refresh của Streamlit dashboard (giây) |
-
----
-
-## 7. Docker Compose
-
-VWAP system tích hợp vào file `docker-compose.yml` ở gốc repo.
-
-### Khởi động ClickHouse (luôn cần)
+### Bước 1: Hạ tầng Docker
 
 ```bash
-docker compose up -d clickhouse-01
-```
+cd /Users/buihung/DATN_Huy/DATN_project
 
-- Mount `vwap_system/clickhouse/init.sql` → `/docker-entrypoint-initdb.d/02_vwap_init.sql`
-- Schema được tạo tự động khi container khởi động lần đầu.
-- Chỉ node `clickhouse-01` chạy Kafka consumer (tránh duplicate consumption trên replicas).
-
-### Khởi động Kafka stack (profile `vwap`)
-
-```bash
+# Bật ClickHouse + MinIO + Kafka (profile vwap)
 docker compose --profile vwap up -d
+
+# Kiểm tra
+docker compose ps
 ```
 
-| Service | Hostname | Port nội bộ | Port từ host |
-|---------|----------|-------------|--------------|
-| `vwap-zookeeper` | `zookeeper` | 2181 | 2181 |
-| `vwap-kafka` | `kafka` | 29092 (INTERNAL) | 9092 (EXTERNAL) |
-| `vwap-kafka-ui` | — | — | 8080 |
-
-> ClickHouse dùng `kafka:29092` (internal listener). Producer từ host dùng `localhost:9092`.
-
-### MinIO
-
-Dùng chung MinIO của project (`localhost:9100`), không cần khởi động riêng.
-
----
-
-## 8. Khởi chạy
-
-### Bước 1 — Cài dependencies
+### Bước 2: Cài đặt dependencies
 
 ```bash
-pip install -e ".[vwap]"
+uv sync --extra vwap
 ```
 
-### Bước 2 — Khởi động hạ tầng
+### Bước 3: Cấu hình .env
 
 ```bash
-# ClickHouse
-docker compose up -d clickhouse-01
-
-# Kafka stack
-docker compose --profile vwap up -d
-```
-
-### Bước 3 — Cấu hình môi trường
-
-```bash
+# Tạo file .env từ template
 cp vwap_system/.env.example .env
-# Chỉnh sửa .env với DNSE_API_KEY, DNSE_API_SECRET và các giá trị thực
+
+# Sửa .env — điền DNSE credentials thật
+# DNSE_API_KEY=your-real-key
+# DNSE_API_SECRET=your-real-secret
 ```
 
-### Bước 4 — Chạy các service
-
-Mở các terminal riêng biệt:
+### Bước 4: Chạy 3 terminal
 
 ```bash
-# Terminal 1 — OHLC Producer
-python -m vwap_system.producer.ohlc_producer
+# Terminal 1: Producer (thu dữ liệu DNSE → Kafka)
+uv run vwap_system/producer/ohlc_producer.py
 
-# Terminal 2 — Alert Detector
-python -m vwap_system.alert_detector.detector
+# Terminal 2: Detector (phân tích + cảnh báo)
+uv run vwap_system/alert_detector/detector.py
 
-# Terminal 3 — Dashboard
-streamlit run vwap_system/dashboard/app.py
-
-# [Tuỳ chọn] Terminal 4 — Tick Producer
-ENABLE_TRADE_PIPELINE=1 python -m vwap_system.producer.trade_producer
+# Terminal 3: Dashboard (giao diện web)
+uv run streamlit run vwap_system/dashboard/app.py
 ```
 
-### Bước 5 — Backup thủ công (tuỳ chọn)
+### Bước 5: Xem kết quả
 
-```bash
-# Export ngày hôm nay
-python -m vwap_system.backup.minio_exporter
+- **Dashboard:** http://localhost:8501
+- **Kafka UI:** http://localhost:8080 (nếu bật)
+- **MinIO Console:** http://localhost:9101
 
-# Export ngày cụ thể
-python -m vwap_system.backup.minio_exporter 2026-05-10
-```
+> **Lưu ý:** Producer chỉ nhận dữ liệu trong giờ giao dịch (9:00 – 14:45 ICT, Thứ 2 – Thứ 6). Ngoài giờ sẽ không có nến mới.
 
 ---
 
-## 9. Lưu ý bảo mật
+## 10. Kiểm tra & Debug
 
-> **Credentials bị hardcode trong source code**
+### Kiểm tra dữ liệu trong ClickHouse
 
-Các file sau chứa DNSE API key/secret được nhúng trực tiếp vào code:
+```bash
+# Số nến hôm nay
+docker compose exec clickhouse-01 clickhouse-client \
+  --user default --password default \
+  -q "SELECT count() FROM vwap.ohlc_raw WHERE toDate(candle_time) = today()"
 
-- `vwap_system/trade_realtime.py`
-- `vwap_system/trade_realtime_template.py`
+# Xem 5 nến gần nhất
+docker compose exec clickhouse-01 clickhouse-client \
+  --user default --password default \
+  -q "SELECT candle_time, symbol, close, volume FROM vwap.ohlc_raw ORDER BY candle_time DESC LIMIT 5"
 
-**Cần thực hiện trước khi commit hoặc deploy:**
+# Xem alerts kết hợp
+docker compose exec clickhouse-01 clickhouse-client \
+  --user default --password default \
+  -q "SELECT alert_time, symbol, alert_type, severity, message FROM vwap.alerts_v2 ORDER BY alert_time DESC LIMIT 10"
+```
 
-1. Rotate API key/secret trên portal DNSE ngay lập tức nếu đã push lên remote.
-2. Xóa credentials hardcode khỏi hai file trên, thay bằng `os.getenv("DNSE_API_KEY")`.
-3. Kiểm tra `.env` thực (có credentials) đã nằm trong `.gitignore` — không được commit vào repo.
+### Log output mẫu
+
+**Producer:**
+```
+2026-05-12 10:00:15 [INFO] ohlc_producer: Kafka producer ready → localhost:9092
+2026-05-12 10:00:16 [INFO] ohlc_producer: Connected to DNSE. Subscribing: ['HPG', 'SSI', ...]
+2026-05-12 10:01:15 [INFO] ohlc_producer: [HPG] 1m close=26.75 vol=150,000 total_sent=200
+```
+
+**Detector:**
+```
+2026-05-12 10:00:20 [INFO] detector: Registered rules: ['COMBINED']
+2026-05-12 10:00:21 [INFO] detector: Warm-up done: 245 candles loaded
+2026-05-12 10:05:30 [WARNING] detector: 🚨 [COMBINED] COMBINED_PUMP_RISK | HPG
+    price=27.50 indicator=78.00 severity=CRITICAL
+    | HPG ⚠️ RỦI RO ĐẨY GIÁ — Breakout VWAP + RSI=78 (quá mua) + KL 4.2x
+```
+
+### Bật lại rule đơn lẻ (nếu cần)
+
+Mở `alert_detector/detector.py`, bỏ comment các dòng 21-23 và 51-55 để chạy song song 3 rule riêng lẻ bên cạnh Combined rule.

@@ -71,6 +71,9 @@ class VWAPCalculator:
     def __init__(self):
         # (symbol, anchor_id) → AnchorState
         self._states: Dict[Tuple[str, str], AnchorState] = {}
+        # (symbol, anchor_id, candle_time) → (old_tp, old_vol)
+        # Dùng để trừ contribution cũ khi nến được cập nhật (intra-candle)
+        self._contributions: Dict[Tuple[str, str, datetime], Tuple[float, int]] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -151,7 +154,23 @@ class VWAPCalculator:
             )
             logger.info(f"Session anchor started: {symbol} @ {ts}")
         s = self._states[key]
+
+        # Kiểm tra xem nến này đã contribute trước đó chưa
+        contrib_key = (symbol, sid, ts)
+        old = self._contributions.get(contrib_key)
+        if old:
+            # Trừ contribution cũ (intra-candle update)
+            old_tp, old_vol = old
+            s.sum_pv -= old_tp * old_vol
+            s.sum_p2v -= (old_tp * old_tp) * old_vol
+            s.sum_qty -= old_vol
+            s.tick_count -= 1
+
+        # Cộng contribution mới
         s.sum_pv += typical_price * volume
         s.sum_p2v += (typical_price * typical_price) * volume
         s.sum_qty += volume
         s.tick_count += 1
+
+        # Ghi nhớ contribution hiện tại
+        self._contributions[contrib_key] = (typical_price, volume)
