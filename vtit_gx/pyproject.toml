@@ -1,0 +1,14 @@
+[project]
+name = "vtit-gx"
+version = "0.1.0"
+description = "Great Expectations data quality validators for Polars DataFrames"
+requires-python = ">=3.10"
+dependencies = [
+    "polars>=1.0.0",
+    "great-expectations>=0.18.22",
+    "loguru>=0.7.0",
+]
+
+[tool.setuptools]
+packages = ["vtit_gx", "vtit_gx.polars"]
+package-dir = {"vtit_gx" = "."}

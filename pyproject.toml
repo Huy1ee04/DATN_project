@@ -6,21 +6,23 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "matplotlib-inline>=0.1.7",
-    "dnse",
     "html2text>=2025.4.15",
     "paho-mqtt>=2.0",
     "python-dotenv>=1.0",
     "requests>=2.31",
+    "dnse",
     "trading-websocket",
-    "vnstock>=3.5.1",
+    "vtit-gx",
     "s3fs>=2026.3.0",
-    "pyarrow>=15.0.0",
+    "pyarrow>=21.0.0",
     "polars>=1.0.0",
+    "great-expectations>=1.10.0",
 ]
 
 [tool.uv.sources]
 dnse = { path = "dnse_sdk/dnse", editable = true }
 trading-websocket = { path = "dnse_sdk/trading_websocket", editable = true }
+vtit-gx = { path = "vtit_gx", editable = true }
 
 [project.optional-dependencies]
 vwap = [
@@ -29,7 +31,6 @@ vwap = [
     "streamlit>=1.32.0",
     "plotly>=5.20.0",
     "pandas>=2.2.0",
-    "pyarrow==15.0.0",
     "minio==7.2.7",
     "python-dotenv==1.0.1"
 ]

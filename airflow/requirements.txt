@@ -1,0 +1,5 @@
+# Cài vào vnstock-venv (dùng --ignore-installed để không lấy nhầm từ Airflow image).
+# vtit_gx: import qua PYTHONPATH=/opt/airflow/packages (mount ./vtit_gx trong Airflow).
+great-expectations>=1.10.0
+loguru>=0.7.0
+marshmallow>=3.7.1,<4.0.0

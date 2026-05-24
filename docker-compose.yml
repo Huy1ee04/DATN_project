@@ -32,6 +32,7 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
     _PIP_ADDITIONAL_REQUIREMENTS: ""
+    PYTHONPATH: /opt/airflow/packages
   volumes:
     - ${AIRFLOW_PROJ_DIR:-./airflow}/dags:/opt/airflow/dags
     - ${AIRFLOW_PROJ_DIR:-./airflow}/logs:/opt/airflow/logs
@@ -45,6 +46,7 @@ x-airflow-common: &airflow-common
     - ./market_ingestion:/opt/airflow/scripts/market_ingestion:ro
     - ./reference_ingestion:/opt/airflow/scripts/reference_ingestion:ro
     - ./transformed:/opt/airflow/scripts/transformed:ro
+    - ./vtit_gx:/opt/airflow/packages/vtit_gx:ro
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
     postgres:
@@ -186,7 +188,8 @@ services:
   # --- vnstock venv setup (chạy 1 lần trước khi up Airflow) ---
   # Lệnh: docker compose run --rm vnstock-setup
   # Tạo /opt/vnstock-venv trong Docker volume, cài vnstock_data qua CLI installer.
-  # Nếu volume đã tồn tại và có python → bỏ qua, không cài lại.
+  # Nếu volume đã tồn tại → vẫn đồng bộ dependency từ airflow/requirements.txt.
+  # vtit_gx không pip-install: mount + PYTHONPATH=/opt/airflow/packages trên Airflow.
   # Để cài lại từ đầu: docker volume rm <project>_vnstock-venv
   vnstock-setup:
     profiles: [setup]
@@ -201,17 +204,21 @@ services:
       - ./airflow/requirements.txt:/tmp/requirements.txt:ro
     command: >
       bash -c "
+        sync_deps() {
+          /opt/vnstock-venv/bin/pip install --no-cache-dir --ignore-installed -r /tmp/requirements.txt;
+        }
         if [ -f /opt/vnstock-venv/bin/python ]; then
-          echo 'venv da ton tai tai /opt/vnstock-venv — bo qua setup.';
-          echo 'De cai lai: docker compose down && docker volume rm <project>_vnstock-venv <project>_vnstock-home';
+          echo 'venv da ton tai tai /opt/vnstock-venv — dong bo dependency...';
+          sync_deps;
+          echo 'Dong bo dependency xong.';
         else
           python3 -m venv /opt/vnstock-venv &&
-          /opt/vnstock-venv/bin/pip install --no-cache-dir --ignore-installed -r /tmp/requirements.txt &&
+          sync_deps &&
           curl -fsSL https://vnstocks.com/files/vnstock-cli-installer.run -o /tmp/installer.run &&
           chmod +x /tmp/installer.run &&
           . /opt/vnstock-venv/bin/activate &&
           HOME=/opt/vnstock-home /tmp/installer.run -- --non-interactive --api-key \"$$VNSTOCK_API_KEY\" --venv-path /opt/vnstock-venv --language en &&
-          /opt/vnstock-venv/bin/pip install --no-cache-dir --ignore-installed -r /tmp/requirements.txt &&
+          sync_deps &&
           chmod -R 755 /opt/vnstock-venv &&
           chmod -R 755 /opt/vnstock-home &&
           echo 'Setup hoan tat! Co the chay: docker compose up -d';

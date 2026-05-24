@@ -39,6 +39,13 @@ docker compose --profile setup run --rm vnstock-setup
 
 Bước (2) tải installer từ vnstocks.com, cài dependency vào volume `vnstock-venv`, đăng ký thiết bị/license vào volume `vnstock-home`. Chỉ chạy lại khi cần cài lại môi trường.
 
+Nếu venv đã tồn tại, `vnstock-setup` vẫn **đồng bộ** package từ `airflow/requirements.txt` (Great Expectations, loguru). Package `vtit_gx` được mount vào Airflow qua `PYTHONPATH`, không cần pip-install.
+
+```bash
+docker compose --profile setup run --rm vnstock-setup
+docker compose up -d airflow-scheduler airflow-webserver
+```
+
 ### Cài lại venv vnstock từ đầu
 
 Service `vnstock-setup` **bỏ qua** cài đặt nếu đã có `/opt/vnstock-venv/bin/python` trong volume. Để làm sạch và chạy lại:
