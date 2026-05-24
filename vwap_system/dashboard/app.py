@@ -128,9 +128,10 @@ def query_df(ch, sql: str, cols: list) -> pd.DataFrame:
 
 # ─── Data loaders ─────────────────────────────────────────────
 
-def load_ohlc_with_indicators(ch, symbol: str, minutes: int, start_time) -> pd.DataFrame:
+def load_ohlc_with_indicators(ch, symbol: str, minutes: int, start_time, selected_date) -> pd.DataFrame:
     """Tải OHLCV (1 phút) + tính running VWAP + RSI qua SQL."""
     start_time_str = start_time.strftime('%H:%M:%S')
+    date_str = selected_date.strftime('%Y-%m-%d')
     df = query_df(ch, f"""
         SELECT * FROM (
             SELECT
@@ -199,7 +200,7 @@ def load_ohlc_with_indicators(ch, symbol: str, minutes: int, start_time) -> pd.D
                 )) AS sigma
                 FROM ohlc_raw
                 WHERE symbol = '{symbol}'
-                  AND toDate(candle_time) = today()
+                  AND toDate(candle_time) = '{date_str}'
             ) t
             WHERE formatDateTime(candle_time, '%H:%M:%S') >= '{start_time_str}'
             ORDER BY time DESC
@@ -226,7 +227,9 @@ def _compute_rsi_series(closes: pd.Series, period: int = 14) -> pd.Series:
     return rsi
 
 
-def load_alerts_v2(ch, limit: int = 50, rule_filter: str = 'ALL') -> pd.DataFrame:
+def load_alerts_v2(ch, limit: int = 50, rule_filter: str = 'ALL', selected_date=None) -> pd.DataFrame:
+    date_str = selected_date.strftime('%Y-%m-%d') if selected_date else 'today()'
+    date_cond = f"toDate(alert_time) = '{date_str}'" if selected_date else "toDate(alert_time) = today()"
     where = ""
     if rule_filter != 'ALL':
         where = f"AND rule_name = '{rule_filter}'"
@@ -234,29 +237,33 @@ def load_alerts_v2(ch, limit: int = 50, rule_filter: str = 'ALL') -> pd.DataFram
         SELECT alert_time, symbol, rule_name, alert_type, severity,
                price, indicator_value, threshold, message
         FROM alerts_v2
-        WHERE toDate(alert_time) = today() {where}
+        WHERE {date_cond} {where}
         ORDER BY alert_time DESC
         LIMIT {limit}
     """, ['time', 'symbol', 'rule', 'type', 'severity',
           'price', 'indicator', 'threshold', 'message'])
 
 
-def load_summary(ch) -> dict:
-    candles = ch.query("SELECT count() FROM ohlc_raw WHERE toDate(candle_time) = today()").result_rows
-    # Thử alerts_v2, fallback alerts cũ
+def load_summary(ch, selected_date=None) -> dict:
+    date_str = selected_date.strftime('%Y-%m-%d') if selected_date else 'today()'
+    date_cond_candle = f"toDate(candle_time) = '{date_str}'" if selected_date else "toDate(candle_time) = today()"
+    date_cond_alert = f"toDate(alert_time) = '{date_str}'" if selected_date else "toDate(alert_time) = today()"
+    candles = ch.query(f"SELECT count() FROM ohlc_raw WHERE {date_cond_candle}").result_rows
     try:
-        alts = ch.query("SELECT count() FROM alerts_v2 WHERE toDate(alert_time) = today()").result_rows
+        alts = ch.query(f"SELECT count() FROM alerts_v2 WHERE {date_cond_alert}").result_rows
     except Exception:
-        alts = ch.query("SELECT count() FROM alerts WHERE toDate(alert_time) = today()").result_rows
+        alts = ch.query(f"SELECT count() FROM alerts WHERE {date_cond_alert}").result_rows
     return {
         'candles': candles[0][0] if candles else 0,
         'alerts': alts[0][0] if alts else 0,
     }
 
 
-def load_last_price(ch, symbol: str) -> float | None:
+def load_last_price(ch, symbol: str, selected_date=None) -> float | None:
+    date_str = selected_date.strftime('%Y-%m-%d') if selected_date else 'today()'
+    date_cond = f"toDate(candle_time) = '{date_str}'" if selected_date else "toDate(candle_time) = today()"
     rows = ch.query(
-        f"SELECT close FROM ohlc_raw WHERE symbol='{symbol}' "
+        f"SELECT close FROM ohlc_raw WHERE symbol='{symbol}' AND {date_cond} "
         f"ORDER BY candle_time DESC LIMIT 1"
     ).result_rows
     return rows[0][0] if rows else None
@@ -397,18 +404,29 @@ def main():
     now_str = datetime.now(ICT).strftime('%H:%M:%S')
 
     # Sidebar
+    today = datetime.now(ICT).date()
+
     with st.sidebar:
         st.title('⚙️ Cài đặt')
         sym = st.selectbox('Mã chứng khoán', SYMBOLS)
+        st.divider()
+        st.markdown('##### 📅 Phiên giao dịch')
+        selected_date = st.date_input('Chọn ngày', value=today)
         start_time_val = st.time_input('Từ thời điểm', value=datetime.strptime('09:00', '%H:%M').time())
         minutes = st.slider('Hiển thị (số nến)', 10, 300, 300)
+        st.divider()
+        st.markdown('##### 🔔 Cảnh báo')
         alert_limit = st.slider('Số cảnh báo hiển thị', 10, 100, 30, step=5)
         rule_filter = st.selectbox(
             'Lọc theo rule',
             ['ALL', 'VWAP', 'RSI', 'VOLUME_SPIKE'],
         )
         st.divider()
-        st.caption(f'🔄 Tự làm mới mỗi {REFRESH_SEC}s')
+        is_today = (selected_date == today)
+        if is_today:
+            st.caption(f'🟢 Realtime — tự làm mới mỗi {REFRESH_SEC}s')
+        else:
+            st.caption(f'📜 Xem lịch sử — {selected_date.strftime("%d/%m/%Y")}')
         st.caption(f'🕐 {now_str} ICT')
 
     # Header
@@ -417,11 +435,12 @@ def main():
     st.markdown('<br>', unsafe_allow_html=True)
 
     # Metrics
-    summary = load_summary(ch)
-    last_price = load_last_price(ch, sym)
+    date_label = 'Hôm nay' if is_today else selected_date.strftime('%d/%m/%Y')
+    summary = load_summary(ch, selected_date)
+    last_price = load_last_price(ch, sym, selected_date)
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric('📊 Candles hôm nay', f"{summary['candles']:,}")
-    c2.metric('🚨 Alerts hôm nay', f"{summary['alerts']}")
+    c1.metric(f'📊 Candles ({date_label})', f"{summary['candles']:,}")
+    c2.metric(f'🚨 Alerts ({date_label})', f"{summary['alerts']}")
     c3.metric(f'💰 Giá {sym}', f'{last_price:.2f}' if last_price else '—')
     c4.metric('⏱️ Cập nhật lúc', now_str)
 
@@ -431,7 +450,7 @@ def main():
     col_chart, col_alerts = st.columns([2, 1])
 
     with col_chart:
-        df = load_ohlc_with_indicators(ch, sym, minutes, start_time_val)
+        df = load_ohlc_with_indicators(ch, sym, minutes, start_time_val, selected_date)
         st.plotly_chart(build_multi_chart(df, sym), use_container_width=True)
 
         # RSI + Volume ratio hiện tại
@@ -454,7 +473,7 @@ def main():
 
     with col_alerts:
         st.markdown('<h3 style="margin-top: 0; padding-bottom: 10px; font-weight: 700; color: #1e293b;">🚨 Tín hiệu gần nhất</h3>', unsafe_allow_html=True)
-        df_alerts = load_alerts_v2(ch, limit=alert_limit, rule_filter=rule_filter)
+        df_alerts = load_alerts_v2(ch, limit=alert_limit, rule_filter=rule_filter, selected_date=selected_date)
         if df_alerts.empty:
             st.info('Chưa có cảnh báo nào trong phiên.')
         else:
@@ -467,9 +486,10 @@ def main():
             )
             st.dataframe(styled, use_container_width=True, hide_index=True)
 
-    # Auto refresh
-    time.sleep(REFRESH_SEC)
-    st.rerun()
+    # Auto refresh only for today (realtime mode)
+    if is_today:
+        time.sleep(REFRESH_SEC)
+        st.rerun()
 
 
 if __name__ == '__main__':
