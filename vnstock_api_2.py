@@ -38,4 +38,4 @@ mkt = Market()
 summary = mkt.equity("TCB").summary()
 print(summary)
 
-OUTPUT_FILE.write_text(summary.to_string(index=False), encoding="utf-8")
+# OUTPUT_FILE.write_text(summary.to_string(index=False), encoding="utf-8")

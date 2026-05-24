@@ -20,7 +20,9 @@ from argparse import ArgumentParser
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
+import polars as pl
 from vnstock_data import Reference
+from vtit_gx.polars.gx_schema_validity import gx_check_columns_to_match_set
 
 from _company_ingest_common import (
     announce_vnstock_key,
@@ -37,6 +39,7 @@ ICT = timezone(timedelta(hours=7))
 INDEX_CODE = "VN30"
 DEDUP_PRIMARY = ("symbol",)
 DEDUP_FALLBACK = ("symbol", "exchange")
+VN30_EXPECTED_COLUMNS = ("symbol",)
 
 
 def _coerce_members_df(df_vn30: pd.DataFrame | pd.Series) -> pd.DataFrame:
@@ -85,6 +88,16 @@ def main() -> None:
     logger.info("Fetching %s index members...", args.index)
     try:
         df_vn30 = _coerce_members_df(ref.index.members(args.index))
+        if df_vn30.empty:
+            logger.warning("Empty %s members DataFrame — skipping write.", args.index)
+            return
+
+        pl_df = pl.from_pandas(df_vn30)
+        gx_check_columns_to_match_set(
+            pl_df,
+            {"column_set": list(VN30_EXPECTED_COLUMNS), "exact_match": True},
+        )
+
         if args.append:
             append_parquet_to_s3(
                 df_vn30,

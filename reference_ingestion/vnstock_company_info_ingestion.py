@@ -19,7 +19,9 @@ from argparse import ArgumentParser
 from datetime import datetime, timedelta, timezone
 import sys
 
+import polars as pl
 from vnstock_data import Reference
+from vtit_gx.polars.gx_schema_validity import gx_check_columns_to_match_set
 
 from _company_ingest_common import (
     announce_vnstock_key,
@@ -37,6 +39,14 @@ FILENAME = "info.parquet"
 # info(): 1 row/symbol; dedup merge chỉ cần symbol (fallback nếu thiếu id-style field)
 DEDUP_KEYS_PRIMARY = ("symbol",)
 DEDUP_KEYS_FALLBACK = ("symbol", "issue_share")
+INFO_EXPECTED_COLUMNS = (
+    "symbol",
+    "name",
+    "sector",
+    "profile",
+    "listing_date",
+    "issued_share",
+)
 
 logger = get_logger("company_info_ingestion")
 
@@ -108,6 +118,15 @@ def main() -> None:
         method_label="company.info",
         logger=logger,
         per_req_delay=INFO_PER_REQ_DELAY,
+    )
+
+    if df_company.empty:
+        logger.warning("Empty company info DataFrame — aborting.")
+        sys.exit(1)
+
+    gx_check_columns_to_match_set(
+        pl.from_pandas(df_company),
+        {"column_set": list(INFO_EXPECTED_COLUMNS), "exact_match": True},
     )
 
     if args.append:

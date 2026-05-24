@@ -23,8 +23,10 @@ import argparse
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
+import polars as pl
 import s3fs
 from dotenv import load_dotenv
+from vtit_gx.polars.gx_schema_validity import gx_check_columns_to_match_set
 
 _script_dir = os.path.dirname(os.path.abspath(__file__))
 for _env_path in [
@@ -62,6 +64,23 @@ DEFAULT_MARKET_PREFIX = "raw/market"
 SUMMARY_PER_REQ_DELAY = 0.33
 WAIT_TIME_ON_ERROR = 65
 BATCH_LOG_SIZE = 50
+EQUITY_SUMMARY_EXPECTED_COLUMNS = (
+    "symbol",
+    "high_52w",
+    "low_52w",
+    "dividend",
+    "beta",
+    "eps",
+    "bvps",
+    "market_cap",
+    "pe",
+    "pb",
+    "roe",
+    "change_1m",
+    "change_1y",
+    "dividend_yield",
+    "foreign_ownership_pct",
+)
 
 
 def _add_ingested_at(df: pd.DataFrame) -> pd.DataFrame:
@@ -201,14 +220,13 @@ def _normalize_summary_to_df(symbol: str, summary) -> pd.DataFrame | None:
     return df
 
 
-def fetch_summary_with_retry(symbol: str) -> pd.DataFrame | None:
+def fetch_summary_with_retry(symbol: str, mkt: Market) -> pd.DataFrame | None:
     """
     Fetch equity(symbol).summary() with retry on rate-limit / timeout.
     Returns None if no data or hard error.
     """
     while True:
         try:
-            mkt = Market()
             raw = mkt.equity(symbol).summary()
             return _normalize_summary_to_df(symbol, raw)
         except SystemExit:
@@ -235,9 +253,10 @@ def fetch_summary_all_symbols(symbols: list[str]) -> pd.DataFrame:
     error_count = 0
 
     logger.info(f"Fetching equity summary() for {total} symbols...")
+    mkt = Market()
 
     for i, symbol in enumerate(symbols, start=1):
-        df = fetch_summary_with_retry(symbol)
+        df = fetch_summary_with_retry(symbol, mkt)
 
         if df is None:
             error_count += 1
@@ -321,6 +340,14 @@ def main():
         return
 
     df_summary = fetch_summary_all_symbols(symbols)
+    if df_summary.empty:
+        logger.warning("No summary rows collected — aborting.")
+        return
+
+    gx_check_columns_to_match_set(
+        pl.from_pandas(df_summary),
+        {"column_set": list(EQUITY_SUMMARY_EXPECTED_COLUMNS), "exact_match": True},
+    )
 
     if args.append:
         append_parquet_to_s3(df_summary, fs, summary_s3_path, dedup_keys=["symbol"])

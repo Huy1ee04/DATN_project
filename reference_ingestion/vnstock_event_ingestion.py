@@ -16,8 +16,10 @@ import argparse
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
+import polars as pl
 import s3fs
 from dotenv import load_dotenv
+from vtit_gx.polars.gx_schema_validity import gx_check_columns_to_match_set
 
 # Load .env if present
 _script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -52,6 +54,13 @@ MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minio_access_key")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minio_secret_key")
 DEFAULT_BUCKET    = os.getenv("MINIO_BUCKET", "stock-data")
 DEFAULT_S3_PREFIX = "raw/reference"
+
+MARKET_EVENTS_EXPECTED_COLUMNS = (
+    "date",
+    "event_name",
+    "event_type",
+    "duration",
+)
 
 
 def _add_ingested_at(df: pd.DataFrame) -> pd.DataFrame:
@@ -174,6 +183,16 @@ def main() -> None:
     logger.info("Fetching market events via ref.events.market()...")
     try:
         df_events = ref.events.market()
+        if df_events is None or df_events.empty:
+            logger.warning("Empty market events DataFrame — skipping write.")
+            return
+
+        pl_df = pl.from_pandas(df_events)
+        gx_check_columns_to_match_set(
+            pl_df,
+            {"column_set": list(MARKET_EVENTS_EXPECTED_COLUMNS), "exact_match": True},
+        )
+
         if args.append:
             append_parquet_to_s3(df_events, fs, event_s3_path,
                                  dedup_keys=["event_name", "notify_date", "symbol"])

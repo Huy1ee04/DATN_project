@@ -25,8 +25,10 @@ import argparse
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
+import polars as pl
 import s3fs
 from dotenv import load_dotenv
+from vtit_gx.polars.gx_schema_validity import gx_check_columns_to_match_set
 
 _script_dir = os.path.dirname(os.path.abspath(__file__))
 for _env_path in [
@@ -65,6 +67,15 @@ BENCHMARK_INDICES: tuple[str, ...] = ("VNINDEX", "VN30", "HNXINDEX", "HNX30")
 OHLC_PER_REQ_DELAY = 0.5
 WAIT_TIME_ON_ERROR = 65
 BATCH_LOG_SIZE = 4
+OHLC_INTRADAY_EXPECTED_COLUMNS = (
+    "symbol",
+    "time",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+)
 
 
 # ------------------------------------------------------------------ #
@@ -360,6 +371,12 @@ def main():
     df_ohlc = fetch_index_ohlcv_all(
         indices, start=args.start, end=args.end, interval=args.interval
     )
+
+    if not df_ohlc.empty:
+        gx_check_columns_to_match_set(
+            pl.from_pandas(df_ohlc),
+            {"column_set": list(OHLC_INTRADAY_EXPECTED_COLUMNS), "exact_match": True},
+        )
 
     write_ohlc_partitioned_parquet(
         df_ohlc,

@@ -14,7 +14,12 @@ from __future__ import annotations
 
 import sys
 
+import polars as pl
 from vnstock_data import Reference
+from vtit_gx.polars.gx_schema_validity import (
+    gx_check_column_values_to_be_of_type,
+    gx_check_columns_to_match_set,
+)
 
 from _company_ingest_common import (
     announce_vnstock_key,
@@ -40,6 +45,32 @@ DEDUP_KEYS_PRIMARY = ("symbol", "id")
 DEDUP_KEYS_FALLBACK = ("symbol", "public_date", "event_title_vi")
 
 logger = get_logger("company_events_ingestion")
+EVENTS_ID_COL = "id"
+EVENTS_EXPECTED_COLUMNS = (
+    "id",
+    "event_name_vi",
+    "event_name_en",
+    "ticker",
+    "event_code",
+    "event_title_vi",
+    "event_title_en",
+    "display_date1",
+    "display_date2",
+    "public_date",
+    "record_date",
+    "exright_date",
+    "payout_date",
+    "value_per_share",
+    "exercise_ratio",
+    "category",
+    "issue_date",
+    "start_date",
+    "end_date",
+    "action_type_vi",
+    "action_type_en",
+    "listing_date",
+    "symbol",
+)
 
 
 def main() -> None:
@@ -92,6 +123,20 @@ def main() -> None:
     )
     if args.date:
         df = filter_by_date_col(df, min_date=args.date, date_col=DATE_COL, logger=logger)
+
+    if df.empty:
+        logger.warning("No rows after fetch/filter — aborting.")
+        sys.exit(1)
+
+    pl_df = pl.from_pandas(df)
+    gx_check_columns_to_match_set(
+        pl_df,
+        {"column_set": list(EVENTS_EXPECTED_COLUMNS), "exact_match": True},
+    )
+    gx_check_column_values_to_be_of_type(
+        pl_df,
+        {"column": EVENTS_ID_COL, "expected_type": "str"},
+    )
 
     if args.append_only:
         append_only_parquet_to_s3(

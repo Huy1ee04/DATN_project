@@ -20,7 +20,9 @@ from argparse import ArgumentParser
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
+import polars as pl
 from vnstock_data import Reference
+from vtit_gx.polars.gx_schema_validity import gx_check_columns_to_match_set
 
 from _company_ingest_common import (
     announce_vnstock_key,
@@ -36,6 +38,16 @@ ICT = timezone(timedelta(hours=7))
 
 DEDUP_PRIMARY = ("symbol",)
 DEDUP_FALLBACK = ("symbol", "exchange")
+EQUITY_EXPECTED_COLUMNS = (
+    "symbol",
+    "exchange",
+    "type",
+    "sid",
+    "organ_short_name",
+    "organ_name",
+    "product_grp_id",
+    "icb_code2",
+)
 
 
 def _filter_equity_hose_stock(df: pd.DataFrame) -> pd.DataFrame:
@@ -86,6 +98,15 @@ def main() -> None:
     logger.info("Fetching equity list (HOSE, STOCK)...")
     try:
         df_equity = _filter_equity_hose_stock(ref.equity.list_by_exchange())
+        if df_equity.empty:
+            logger.warning("Empty equity DataFrame after filter — skipping write.")
+            return
+
+        gx_check_columns_to_match_set(
+            pl.from_pandas(df_equity),
+            {"column_set": list(EQUITY_EXPECTED_COLUMNS), "exact_match": True},
+        )
+
         if args.append:
             append_parquet_to_s3(
                 df_equity,
