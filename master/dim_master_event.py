@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-publish_dim_date_event_to_master.py
+dim_master_event.py
 
 Đưa dữ liệu từ layer transformed lên master (dimension).
 
@@ -10,10 +10,8 @@ Source (MinIO):
 Destination (MinIO):
   master/dimension/dim_master_event.parquet
 
-Logic updated_at:
-  Bỏ hoàn toàn cột updated_at từ file transformed (nếu có), rồi chỉ gán updated_at
-  theo thời điểm publish lên master (ICT, một mốc cho cả batch). Các cột khác
-  (ví dụ transformed_at) giữ nguyên từ nguồn.
+Logic publish:
+  - Lấy tương ứng từ transform.
 """
 
 import io
@@ -39,7 +37,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-logger = logging.getLogger("publish_dim_date_event_to_master")
+logger = logging.getLogger("dim_master_event_publish")
 ICT = timezone(timedelta(hours=7))
 
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://localhost:9100")
@@ -69,13 +67,6 @@ def read_parquet(fs: s3fs.S3FileSystem, s3_path: str) -> pl.DataFrame:
         df = pl.read_parquet(io.BytesIO(f.read()))
     logger.info(f"  → {df.shape[0]:,} rows × {df.shape[1]} cols")
     return df
-
-
-def apply_master_updated_at(df: pl.DataFrame) -> pl.DataFrame:
-    """Không mang updated_at từ transformed; chỉ có updated_at của master."""
-    out = df.drop("updated_at") if "updated_at" in df.columns else df
-    updated_at = datetime.now(ICT).strftime("%Y-%m-%dT%H:%M:%S%z")
-    return out.with_columns(pl.lit(updated_at).alias("updated_at"))
 
 
 def write_parquet(
@@ -143,8 +134,8 @@ def main() -> None:
         logger.error("Source is empty — aborting.")
         return
 
-    df_out = apply_master_updated_at(df)
-    write_parquet(df_out, fs, dst, overwrite=args.overwrite)
+    # Dim master: lấy tương ứng từ transform
+    write_parquet(df, fs, dst, overwrite=args.overwrite)
 
     separator = "=" * 80
     logger.info("\n%s\ndim_master_event publish complete!\n%s", separator, separator)
@@ -152,3 +143,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

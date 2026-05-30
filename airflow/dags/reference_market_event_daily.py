@@ -3,7 +3,7 @@ reference_market_event_daily.py
 
 DAG lập lịch lấy lịch sự kiện thị trường (market events calendar) và ghi MinIO.
 
-Script: reference_ingestion/vnstock_event_ingestion.py
+Script: ingestion/reference/vnstock_event_ingestion.py
   - Gọi Reference().events.market() (một lần, toàn thị trường).
   - Ghi: raw/reference/event/event.parquet
   - --append: merge với file cũ, dedup theo các key có trong DataFrame.
@@ -11,7 +11,7 @@ Script: reference_ingestion/vnstock_event_ingestion.py
 Lịch chạy: 00:20 UTC = 07:20 ICT hàng ngày.
 
 Yêu cầu (xem docker-compose.yml):
-  - ./reference_ingestion  mount tại /opt/airflow/scripts/reference_ingestion
+  - ./ingestion/reference  mount tại /opt/airflow/scripts/reference_ingestion
   - ./vtit_gx              mount tại /opt/airflow/packages/vtit_gx (PYTHONPATH=/opt/airflow/packages)
   - ./.env                 mount tại /opt/airflow/.env
   - vnstock-venv volume    mount tại /opt/vnstock-venv (tạo bởi: docker compose run --rm vnstock-setup)
@@ -31,7 +31,7 @@ ENV_FILE = "/opt/airflow/.env"
 _SOURCE_ENV = (
     f"set -a && source {ENV_FILE} && set +a && "
     "export HOME=/opt/vnstock-home && "
-    "export MINIO_ENDPOINT=http://minio:9000 && "
+    "export MINIO_ENDPOINT=http://minio:9100 && "
     "export MPLCONFIGDIR=/tmp/mplconfig-airflow"
 )
 

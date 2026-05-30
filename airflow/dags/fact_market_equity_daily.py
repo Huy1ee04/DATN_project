@@ -33,7 +33,7 @@ ENV_FILE = "/opt/airflow/.env"
 _SOURCE_ENV = (
     f"set -a && source {ENV_FILE} && set +a && "
     "export HOME=/opt/vnstock-home && "
-    "export MINIO_ENDPOINT=http://minio:9000 && "
+    "export MINIO_ENDPOINT=http://minio:9100 && "
     "export MPLCONFIGDIR=/tmp/mplconfig-airflow"
 )
 

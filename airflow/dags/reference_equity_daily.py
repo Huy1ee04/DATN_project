@@ -3,7 +3,7 @@ reference_equity_daily.py
 
 DAG lập lịch lấy danh sách cổ phiếu HOSE/STOCK và ghi snapshot lên MinIO.
 
-Script: reference_ingestion/vnstock_equity_ingestion.py
+Script: ingestion/reference/vnstock_equity_ingestion.py
   - Gọi Reference().equity.list_by_exchange(), lọc HOSE + STOCK.
   - Ghi đè snapshot: raw/reference/equity/equity.parquet (không truyền --append).
   - File này là nguồn symbol cho market_equity_summary_daily và các pipeline khác.
@@ -11,7 +11,7 @@ Script: reference_ingestion/vnstock_equity_ingestion.py
 Lịch chạy: 00:00 UTC = 07:00 ICT hàng ngày — chạy sớm nhất trong nhóm reference.
 
 Yêu cầu (xem docker-compose.yml):
-  - ./reference_ingestion  mount tại /opt/airflow/scripts/reference_ingestion
+  - ./ingestion/reference  mount tại /opt/airflow/scripts/reference_ingestion
   - ./vtit_gx              mount tại /opt/airflow/packages/vtit_gx (PYTHONPATH=/opt/airflow/packages)
   - ./.env                 mount tại /opt/airflow/.env
   - vnstock-venv volume    mount tại /opt/vnstock-venv (tạo bởi: docker compose run --rm vnstock-setup)
@@ -31,7 +31,7 @@ ENV_FILE = "/opt/airflow/.env"
 _SOURCE_ENV = (
     f"set -a && source {ENV_FILE} && set +a && "
     "export HOME=/opt/vnstock-home && "
-    "export MINIO_ENDPOINT=http://minio:9000 && "
+    "export MINIO_ENDPOINT=http://minio:9100 && "
     "export MPLCONFIGDIR=/tmp/mplconfig-airflow"
 )
 

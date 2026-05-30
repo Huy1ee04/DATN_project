@@ -19,7 +19,7 @@ Task:
   Hai task chạy song song, không phụ thuộc nhau.
 
 Yêu cầu (xem docker-compose.yml):
-  - ./market_ingestion  mount tại /opt/airflow/scripts/market_ingestion
+  - ./ingestion/market  mount tại /opt/airflow/scripts/market_ingestion
   - ./.env              mount tại /opt/airflow/.env
   - vnstock-venv volume mount tại /opt/vnstock-venv (tạo bởi: docker compose run --rm vnstock-setup)
 """
@@ -39,7 +39,7 @@ ENV_FILE = "/opt/airflow/.env"
 _SOURCE_ENV = (
     f"set -a && source {ENV_FILE} && set +a && "
     "export HOME=/opt/vnstock-home && "
-    "export MINIO_ENDPOINT=http://minio:9000 && "
+    "export MINIO_ENDPOINT=http://minio:9100 && "
     "export MPLCONFIGDIR=/tmp/mplconfig-airflow"
 )
 

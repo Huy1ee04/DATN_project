@@ -3,7 +3,7 @@ market_equity_summary_daily.py
 
 DAG lập lịch lấy Market().equity(symbol).summary() cho toàn bộ mã trong equity.parquet.
 
-Script: market_ingestion/vnstock_equity_summary_ingestion.py
+Script: ingestion/market/vnstock_equity_summary_ingestion.py
   - Đọc symbol từ raw/reference/equity/equity.parquet.
   - Ghi: raw/market/equity/summary.parquet
   - --append: merge + dedup theo symbol (row mới ưu tiên).
@@ -12,8 +12,8 @@ Lịch chạy: 01:00 UTC = 08:00 ICT hàng ngày — sau reference_equity_daily 
 để đảm bảo equity.parquet đã được cập nhật.
 
 Yêu cầu (xem docker-compose.yml):
-  - ./market_ingestion  mount tại /opt/airflow/scripts/market_ingestion
-  - ./reference_ingestion (equity.parquet) qua MinIO, không mount trực tiếp
+  - ./ingestion/market  mount tại /opt/airflow/scripts/market_ingestion
+  - ./ingestion/reference (equity.parquet) qua MinIO, không mount trực tiếp
   - ./vtit_gx           mount tại /opt/airflow/packages/vtit_gx (PYTHONPATH=/opt/airflow/packages)
   - ./.env              mount tại /opt/airflow/.env
   - vnstock-venv volume mount tại /opt/vnstock-venv (tạo bởi: docker compose run --rm vnstock-setup)
@@ -33,7 +33,7 @@ ENV_FILE = "/opt/airflow/.env"
 _SOURCE_ENV = (
     f"set -a && source {ENV_FILE} && set +a && "
     "export HOME=/opt/vnstock-home && "
-    "export MINIO_ENDPOINT=http://minio:9000 && "
+    "export MINIO_ENDPOINT=http://minio:9100 && "
     "export MPLCONFIGDIR=/tmp/mplconfig-airflow"
 )
 

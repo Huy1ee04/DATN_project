@@ -3,7 +3,7 @@ reference_company_events_daily.py
 
 DAG lập lịch lấy dữ liệu corporate events cho tất cả mã HOSE mỗi ngày.
 
-Script: reference_ingestion/vnstock_company_events_ingestion.py
+Script: ingestion/reference/vnstock_company_events_ingestion.py
   - Gọi Reference().company(symbol).events() cho từng mã.
   - Ghi vào file gốc: raw/reference/company/events/events.parquet
   - --append: read → concat → dedup (symbol, id) → ghi đè an toàn, giữ toàn bộ dữ liệu cũ.
@@ -20,7 +20,7 @@ Trigger trên Airflow UI (ví dụ):
     {"min_public_date": "2026-05-01"}
 
 Yêu cầu (xem docker-compose.yml):
-  - ./reference_ingestion  mount tại /opt/airflow/scripts/reference_ingestion
+  - ./ingestion/reference  mount tại /opt/airflow/scripts/reference_ingestion
   - ./.env                 mount tại /opt/airflow/.env
   - vnstock-venv volume    mount tại /opt/vnstock-venv (tạo bởi: docker compose run --rm vnstock-setup)
 """
@@ -39,7 +39,7 @@ ENV_FILE = "/opt/airflow/.env"
 _SOURCE_ENV = (
     f"set -a && source {ENV_FILE} && set +a && "
     "export HOME=/opt/vnstock-home && "
-    "export MINIO_ENDPOINT=http://minio:9000 && "
+    "export MINIO_ENDPOINT=http://minio:9100 && "
     "export MPLCONFIGDIR=/tmp/mplconfig-airflow"
 )
 

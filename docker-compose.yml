@@ -43,8 +43,8 @@ x-airflow-common: &airflow-common
     # home dir của vnii — cần ghi được để vnii tạo/đọc device id, license cache
     - vnstock-home:/opt/vnstock-home
     # Scripts ingestion/transform — BashOperator gọi /opt/vnstock-venv/bin/python
-    - ./market_ingestion:/opt/airflow/scripts/market_ingestion:ro
-    - ./reference_ingestion:/opt/airflow/scripts/reference_ingestion:ro
+    - ./ingestion/market:/opt/airflow/scripts/market_ingestion:ro
+    - ./ingestion/reference:/opt/airflow/scripts/reference_ingestion:ro
     - ./transformed:/opt/airflow/scripts/transformed:ro
     - ./vtit_gx:/opt/airflow/packages/vtit_gx:ro
   user: "${AIRFLOW_UID:-50000}:0"
@@ -122,14 +122,17 @@ services:
     container_name: datn-project-minio
     hostname: minio
     ports:
-      - "9100:9000"
-      - "9101:9001"
+      - "9100:9100"
+      - "9101:9101"
     volumes:
       - minio_storage:/data
     environment:
       MINIO_ROOT_USER: minio_access_key
       MINIO_ROOT_PASSWORD: minio_secret_key
-    command: server --console-address ":9001" /data
+      MINIO_SERVER_URL: http://localhost:9100
+      MINIO_BROWSER_REDIRECT_URL: http://localhost:9101
+      MINIO_BROWSER_CONTENT_SECURITY_POLICY: "default-src 'self' 'unsafe-eval' 'unsafe-inline'; script-src 'self' https://unpkg.com; connect-src 'self' https://unpkg.com https://dl.min.io"
+    command: server --address ":9100" --console-address ":9101" /data
     networks:
       - datn-project-net
 

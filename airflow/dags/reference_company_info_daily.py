@@ -4,7 +4,7 @@ reference_company_info_daily.py
 DAG lập lịch lấy thông tin tổng quan công ty (company overview) cho toàn bộ mã HOSE STOCK
 qua Reference().company(symbol).info() và ghi snapshot lên MinIO.
 
-Script: reference_ingestion/vnstock_company_info_ingestion.py
+Script: ingestion/reference/vnstock_company_info_ingestion.py
   - Lấy danh sách mã từ ref.equity.list_by_exchange() (mặc định HOSE + STOCK).
   - Ghi đè snapshot: raw/reference/company/info/info.parquet (không truyền --append).
   - Mỗi lần chạy thay thế toàn bộ file; atomic write qua .tmp trong script.
@@ -14,7 +14,7 @@ Lịch chạy: 03:00 UTC = 10:00 ICT hàng ngày — lệch sau DAG events (01 U
 
 Optional (giống market_ohlc_intraday_daily): có thể bổ sung sau conf / params
 nếu script hỗ trợ lọc theo ngày; hiện tại luôn full refresh. (xem docker-compose.yml):
-  - ./reference_ingestion  mount tại /opt/airflow/scripts/reference_ingestion
+  - ./ingestion/reference  mount tại /opt/airflow/scripts/reference_ingestion
   - ./.env                 mount tại /opt/airflow/.env
   - vnstock-venv volume    mount tại /opt/vnstock-venv (tạo bởi: docker compose run --rm vnstock-setup)
 """
@@ -33,7 +33,7 @@ ENV_FILE = "/opt/airflow/.env"
 _SOURCE_ENV = (
     f"set -a && source {ENV_FILE} && set +a && "
     "export HOME=/opt/vnstock-home && "
-    "export MINIO_ENDPOINT=http://minio:9000 && "
+    "export MINIO_ENDPOINT=http://minio:9100 && "
     "export MPLCONFIGDIR=/tmp/mplconfig-airflow"
 )
 

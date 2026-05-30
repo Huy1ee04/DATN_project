@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
-vnstock_index_ohlc_intraday_ingestion.py
+vnstock_equity_ohlc_intraday_ingestion.py
 
-Fetch intraday OHLCV for benchmark indices using:
-  mkt.index(symbol).ohlcv(start, end, interval="1m")
+Fetch intraday OHLCV for equity symbols using:
+  mkt.equity(symbol).ohlcv(start, end, interval="1m")
 
-Indices mặc định: VNINDEX, VN30, HNXINDEX, HNX30.
-
-Target structure in MinIO (Hive-style partition theo ngày):
-  raw/market/index/year=YYYY/month=MM/day=DD/ohlc.parquet
+Target structure in MinIO (partitioned by năm/tháng/ngày của cột ``time``):
+  raw/market/equity/ohlc_{interval}/YYYY/MM/DD/ohlc.parquet
 
 Behavior:
  - Default interval: 1m (minute-bar); configurable via --interval.
  - Default date range: today (ICT) → today.
- - Danh sách indices: dùng BENCHMARK_INDICES mặc định hoặc --indices flag.
+ - Symbol source (theo thứ tự ưu tiên):
+     1. --symbols flag (truyền thẳng qua CLI)
+     2. Reference().equity.list_by_exchange() lọc theo --exchange / --instrument-type
+     3. Fallback: raw/reference/equity/equity.csv trên MinIO (nếu API lỗi)
  - Skip existing partition files unless --append.
  - Retry on rate-limit / timeout (including SystemExit from vnstock).
 """
@@ -34,16 +35,16 @@ _script_dir = os.path.dirname(os.path.abspath(__file__))
 for _env_path in [
     os.path.join(_script_dir, ".env"),
     os.path.join(_script_dir, "..", ".env"),
-    os.path.join(_script_dir, "..", "reference_ingestion", ".env"),
+    os.path.join(_script_dir, "..", "reference", ".env"),
 ]:
     if os.path.isfile(_env_path):
         load_dotenv(dotenv_path=_env_path)
         break
 
-from vnstock_data import Market
+from vnstock_data import Market, Reference
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("index_ohlc_intraday_ingestion")
+logger = logging.getLogger("equity_ohlc_intraday_ingestion")
 ICT = timezone(timedelta(hours=7))
 
 vnstock_key = os.getenv("VNSTOCK_API_KEY")
@@ -62,11 +63,10 @@ MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minio_secret_key")
 DEFAULT_BUCKET = os.getenv("MINIO_BUCKET", "stock-data")
 DEFAULT_MARKET_PREFIX = "raw/market"
 
-BENCHMARK_INDICES: tuple[str, ...] = ("VNINDEX", "VN30", "HNXINDEX", "HNX30")
-
+# Intraday có nhiều row hơn → delay cao hơn một chút để tránh rate-limit
 OHLC_PER_REQ_DELAY = 0.5
 WAIT_TIME_ON_ERROR = 65
-BATCH_LOG_SIZE = 4
+BATCH_LOG_SIZE = 20
 OHLC_INTRADAY_EXPECTED_COLUMNS = (
     "symbol",
     "time",
@@ -101,7 +101,7 @@ def _write_parquet_and_log(
 
 
 def _df_with_partition_date(df: pd.DataFrame) -> pd.DataFrame | None:
-    """Thêm cột _partition_date (date only) để Hive-style partition YYYY/MM/DD."""
+    """Thêm cột _partition_date (date only) để hive-style partition YYYY/MM/DD."""
     if df is None or df.empty:
         return None
     time_col = next((c for c in ("time", "date", "tradingDate") if c in df.columns), None)
@@ -211,31 +211,78 @@ def write_ohlc_partitioned_parquet(
     )
 
 
+def _normalize_symbols(series: pd.Series) -> list[str]:
+    """Chuẩn hóa Series mã chứng khoán: strip, upper, bỏ NA/rỗng, dedup."""
+    return (
+        series.astype(str)
+        .str.strip()
+        .str.upper()
+        .replace("", pd.NA)
+        .dropna()
+        .drop_duplicates()
+        .tolist()
+    )
+
+
+def fetch_exchange_symbols(exchange: str = "HOSE", instrument_type: str = "STOCK") -> list[str]:
+    """
+    Lấy danh sách mã từ Reference API, lọc theo exchange + type.
+    Trả về list rỗng nếu API gặp lỗi.
+    """
+    try:
+        df_all = Reference().equity.list_by_exchange()
+        if df_all is None or df_all.empty:
+            logger.warning("list_by_exchange() returned empty DataFrame.")
+            return []
+
+        mask = pd.Series([True] * len(df_all), index=df_all.index)
+        if "exchange" in df_all.columns:
+            mask &= df_all["exchange"].astype(str).str.upper() == exchange.upper()
+        else:
+            logger.warning("Column 'exchange' not found; skipping exchange filter.")
+        if "type" in df_all.columns:
+            mask &= df_all["type"].astype(str).str.upper() == instrument_type.upper()
+        else:
+            logger.warning("Column 'type' not found; skipping type filter.")
+
+        df_filtered = df_all[mask].reset_index(drop=True)
+        if "symbol" not in df_filtered.columns:
+            logger.error("Column 'symbol' not found in list_by_exchange() result.")
+            return []
+
+        symbols = _normalize_symbols(df_filtered["symbol"])
+        logger.info(f"Fetched {len(symbols)} symbols from Reference API (exchange={exchange}, type={instrument_type})")
+        return symbols
+
+    except Exception as e:
+        logger.error(f"fetch_exchange_symbols() failed: {e}")
+        return []
+
+
+
+
 # ------------------------------------------------------------------ #
 # Fetching                                                            #
 # ------------------------------------------------------------------ #
 
-def fetch_index_ohlcv_with_retry(
+def fetch_ohlcv_intraday_with_retry(
     symbol: str, start: str, end: str, interval: str
 ) -> pd.DataFrame | None:
     """
-    Gọi mkt.index(symbol).ohlcv(start, end, interval) với retry vô hạn
+    Gọi mkt.equity(symbol).ohlcv(start, end, interval) với retry vô hạn
     khi gặp rate-limit / timeout.
     """
     while True:
         try:
             mkt = Market()
-            df = mkt.index(symbol).ohlcv(start=start, end=end, interval=interval)
+            df = mkt.equity(symbol).ohlcv(start=start, end=end, interval=interval)
             if df is not None and not df.empty:
+                df = df.copy()
                 if "symbol" not in df.columns:
-                    df = df.copy()
                     df.insert(0, "symbol", symbol)
                 else:
-                    df = df.copy()
-                    df["symbol"] = df["symbol"].where(
-                        df["symbol"].notna() & (df["symbol"].astype(str).str.strip() != ""),
-                        symbol,
-                    )
+                    blank = df["symbol"].isna() | (df["symbol"].astype(str).str.strip() == "")
+                    df["symbol"] = df["symbol"].where(~blank, symbol)
                     df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
             return df
         except SystemExit:
@@ -255,21 +302,21 @@ def fetch_index_ohlcv_with_retry(
                 return None
 
 
-def fetch_index_ohlcv_all(
-    indices: list[str],
+def fetch_ohlcv_intraday_all_symbols(
+    symbols: list[str],
     start: str,
     end: str,
     interval: str,
 ) -> pd.DataFrame:
-    total = len(indices)
+    total = len(symbols)
     results: list[pd.DataFrame] = []
     empty_count = 0
     error_count = 0
 
-    logger.info(f"Fetching index OHLCV [{interval}] [{start} → {end}] for {total} indices: {indices}")
+    logger.info(f"Fetching intraday OHLCV [{interval}] [{start} → {end}] for {total} symbols...")
 
-    for i, symbol in enumerate(indices, start=1):
-        df = fetch_index_ohlcv_with_retry(symbol, start, end, interval)
+    for i, symbol in enumerate(symbols, start=1):
+        df = fetch_ohlcv_intraday_with_retry(symbol, start, end, interval)
 
         if df is None:
             error_count += 1
@@ -278,7 +325,6 @@ def fetch_index_ohlcv_all(
             empty_count += 1
         else:
             results.append(df)
-            logger.info(f"[{i}/{total}] {symbol} — {len(df):,} rows fetched.")
 
         time.sleep(OHLC_PER_REQ_DELAY)
 
@@ -292,7 +338,7 @@ def fetch_index_ohlcv_all(
         return pd.DataFrame()
 
     df_all = pd.concat(results, ignore_index=True)
-    logger.info(f"Total rows: {len(df_all):,} from {len(results)} indices.")
+    logger.info(f"Total rows: {len(df_all):,} from {len(results)} symbols.")
     return df_all
 
 
@@ -303,7 +349,7 @@ def fetch_index_ohlcv_all(
 def parse_args():
     today_ict = datetime.now(ICT).strftime("%Y-%m-%d")
     p = argparse.ArgumentParser(
-        description="Fetch VNStock intraday index OHLCV → MinIO S3 (Parquet, partitioned by date)."
+        description="Fetch VNStock intraday equity OHLCV → MinIO S3 (Parquet, partitioned by date)."
     )
     p.add_argument("--bucket", default=DEFAULT_BUCKET, help="MinIO bucket name")
     p.add_argument("--market-prefix", default=DEFAULT_MARKET_PREFIX, help="Prefix for output market data")
@@ -314,11 +360,16 @@ def parse_args():
         help="OHLCV candle interval: 1m, 5m, 15m, 30m, 1h, 1D, … (default: 1m)"
     )
     p.add_argument(
-        "--indices", nargs="+", default=list(BENCHMARK_INDICES),
-        help=(
-            "Danh sách chỉ số cần lấy (space-separated). "
-            f"Mặc định: {' '.join(BENCHMARK_INDICES)}"
-        ),
+        "--symbols", nargs="+",
+        help="Override symbol list (space-separated). Skips API/equity.csv lookup if set."
+    )
+    p.add_argument(
+        "--exchange", default="HOSE",
+        help="Sàn giao dịch để lọc từ Reference API: HOSE, HNX, UPCOM (default: HOSE)."
+    )
+    p.add_argument(
+        "--instrument-type", default="STOCK", dest="instrument_type",
+        help="Loại chứng khoán: STOCK, ETF, … (default: STOCK)."
     )
     p.add_argument(
         "--append", action="store_true",
@@ -327,24 +378,28 @@ def parse_args():
     return p.parse_args()
 
 
-def log_run_info(args: argparse.Namespace, market_prefix: str, indices: list[str]) -> None:
+def log_run_info(args: argparse.Namespace, market_prefix: str) -> None:
     separator = "=" * 80
+    symbol_source = (
+        "--symbols flag" if args.symbols
+        else f"Reference API (exchange={args.exchange}, type={args.instrument_type})"
+    )
     mode = "append" if args.append else "write (skip if exists)"
     run_at = datetime.now(ICT).strftime("%Y-%m-%d %H:%M:%S %Z")
     logger.info(
-        "\n%s\nFetch VNStock Index Intraday OHLCV → MinIO S3 (Parquet, partitioned)\n%s\n"
+        "\n%s\nFetch VNStock Equity Intraday OHLCV → MinIO S3 (Parquet, partitioned)\n%s\n"
         "MinIO Endpoint    : %s\n"
         "Interval          : %s\n"
         "Date range        : %s  →  %s\n"
-        "Indices           : %s\n"
-        "Target output     : s3://%s/index/year=YYYY/month=MM/day=DD/ohlc.parquet\n"
+        "Symbol source     : %s\n"
+        "Target output     : s3://%s/equity/year=YYYY/month=MM/day=DD/ohlc.parquet\n"
         "Mode              : %s\n"
         "Run at            : %s\n%s",
         separator, separator,
         MINIO_ENDPOINT,
         args.interval,
         args.start, args.end,
-        ", ".join(indices),
+        symbol_source,
         market_prefix,
         mode,
         run_at,
@@ -355,12 +410,7 @@ def log_run_info(args: argparse.Namespace, market_prefix: str, indices: list[str
 def main():
     args = parse_args()
     market_prefix = f"{args.bucket}/{args.market_prefix}"
-    indices = [s.strip().upper() for s in args.indices if s.strip()]
-    log_run_info(args, market_prefix, indices)
-
-    if not indices:
-        logger.error("No indices specified — aborting.")
-        return
+    log_run_info(args, market_prefix)
 
     fs = s3fs.S3FileSystem(
         key=MINIO_ACCESS_KEY,
@@ -368,8 +418,25 @@ def main():
         client_kwargs={"endpoint_url": MINIO_ENDPOINT},
     )
 
-    df_ohlc = fetch_index_ohlcv_all(
-        indices, start=args.start, end=args.end, interval=args.interval
+    if args.symbols:
+        # Ưu tiên danh sách truyền thẳng qua CLI
+        symbols = [s.strip().upper() for s in args.symbols if s.strip()]
+        logger.info(
+            f"Using {len(symbols)} symbol(s) from --symbols: "
+            f"{symbols[:10]}{'...' if len(symbols) > 10 else ''}"
+        )
+    else:
+        symbols = fetch_exchange_symbols(
+            exchange=args.exchange,
+            instrument_type=args.instrument_type,
+        )
+
+    if not symbols:
+        logger.error("No symbols to process — aborting.")
+        return
+
+    df_ohlc = fetch_ohlcv_intraday_all_symbols(
+        symbols, start=args.start, end=args.end, interval=args.interval
     )
 
     if not df_ohlc.empty:
@@ -382,12 +449,12 @@ def main():
         df_ohlc,
         fs,
         market_prefix,
-        "index",
+        "equity",
         append=args.append,
     )
 
     separator = "=" * 80
-    logger.info("\n%s\nIndex intraday OHLCV ingestion complete!\n%s", separator, separator)
+    logger.info("\n%s\nIntraday equity OHLCV ingestion complete!\n%s", separator, separator)
 
 
 if __name__ == "__main__":

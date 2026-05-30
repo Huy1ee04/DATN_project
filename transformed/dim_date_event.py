@@ -12,8 +12,9 @@ Join: left join on key "date"
 
 Output (MinIO):
   transformed/dimension/dim_date_event.parquet
-  (không giữ ingested_at từ raw; có cột updated_at khi ghi transform;
+  (không giữ ingested_at từ raw;
    cột week → cal_week; event_type → is_holiday (1 nếu event_type có giá trị, 0 nếu không);
+   is_holiday + is_weekend → is_day_off; event_name cuối tuần → 'Cuối tuần';
    không giữ cột duration)
 """
 
@@ -27,8 +28,9 @@ import polars as pl
 import s3fs
 from dotenv import load_dotenv
 
-# ── Load .env ────────────────────────────────────────────────────────────────
 _script_dir = os.path.dirname(os.path.abspath(__file__))
+
+# ── Load .env ────────────────────────────────────────────────────────────────
 for _env_path in [
     os.path.join(_script_dir, ".env"),
     os.path.join(_script_dir, "..", ".env"),
@@ -87,7 +89,6 @@ def write_parquet(
     s3_path: str,
     overwrite: bool = False,
 ) -> None:
-    """Ghi Polars DataFrame lên MinIO dưới dạng parquet (snappy)."""
     if fs.exists(s3_path) and not overwrite:
         logger.info(f"Exists, skipping: s3://{s3_path}  (dùng --overwrite để ghi đè)")
         return
@@ -114,7 +115,8 @@ def transform(
 
     Sau join: bỏ cột ingested_at từ nguồn (nếu có); đổi week → cal_week; thay event_type
     bằng is_holiday (1 khi event_type khác null và khác chuỗi rỗng sau trim, 0 ngược lại);
-    bỏ duration; thêm updated_at (thời điểm transform, ICT).
+    gộp is_holiday và is_weekend thành is_day_off; event_name ngày cuối tuần ghi 'Cuối tuần';
+    bỏ duration.
     """
     # Đảm bảo cột join cùng kiểu dữ liệu (Date)
     # Xử lý nhiều trường hợp kiểu dữ liệu của cột date trong parquet nguồn:
@@ -170,11 +172,34 @@ def transform(
     else:
         df_joined = df_joined.with_columns(pl.lit(0).cast(pl.Int8).alias("is_holiday"))
 
+    if "is_weekend" not in df_joined.columns:
+        df_joined = df_joined.with_columns(
+            (pl.col(JOIN_KEY).dt.weekday() >= 6).cast(pl.Int8).alias("is_weekend")
+        )
+    else:
+        df_joined = df_joined.with_columns(pl.col("is_weekend").cast(pl.Int8))
+
+    weekend = pl.col("is_weekend") == 1
+    if "event_name" in df_joined.columns:
+        df_joined = df_joined.with_columns(
+            pl.when(weekend)
+            .then(pl.lit("Cuối tuần"))
+            .otherwise(pl.col("event_name"))
+            .alias("event_name")
+        )
+    else:
+        df_joined = df_joined.with_columns(
+            pl.when(weekend).then(pl.lit("Cuối tuần")).otherwise(None).alias("event_name")
+        )
+
+    df_joined = df_joined.with_columns(
+        ((pl.col("is_holiday") == 1) | weekend)
+        .cast(pl.Int8)
+        .alias("is_day_off")
+    ).drop("is_holiday", "is_weekend")
+
     if "duration" in df_joined.columns:
         df_joined = df_joined.drop("duration")
-
-    updated_at = datetime.now(ICT).strftime("%Y-%m-%dT%H:%M:%S%z")
-    df_joined = df_joined.with_columns(pl.lit(updated_at).alias("updated_at"))
 
     logger.info(
         f"Join result: {df_joined.shape[0]:,} rows × {df_joined.shape[1]} cols"

@@ -38,3 +38,6 @@ airflow/airflow.db
 airflow/airflow.cfg
 airflow/webserver_config.py
 airflow/standalone_admin_password.txt
+
+# Test / scratch files
+test_vtit_gx.py

@@ -3,7 +3,7 @@ reference_vn30_daily.py
 
 DAG lập lịch lấy thành phần chỉ số VN30 và ghi snapshot lên MinIO.
 
-Script: reference_ingestion/vnstock_vn30_ingestion.py
+Script: ingestion/reference/vnstock_vn30_ingestion.py
   - Gọi Reference().index.members("VN30").
   - Ghi đè snapshot: raw/reference/equity/vn30.parquet (không truyền --append).
   - Mỗi lần chạy thay thế toàn bộ file; atomic write qua .tmp trong script.
@@ -17,7 +17,7 @@ Trigger tay trên Airflow UI (tuỳ chọn chỉ số khác):
     {"index_code": "VN30"}
 
 Yêu cầu (xem docker-compose.yml):
-  - ./reference_ingestion  mount tại /opt/airflow/scripts/reference_ingestion
+  - ./ingestion/reference  mount tại /opt/airflow/scripts/reference_ingestion
   - ./.env                 mount tại /opt/airflow/.env
   - vnstock-venv volume    mount tại /opt/vnstock-venv (tạo bởi: docker compose run --rm vnstock-setup)
 """
@@ -36,7 +36,7 @@ ENV_FILE = "/opt/airflow/.env"
 _SOURCE_ENV = (
     f"set -a && source {ENV_FILE} && set +a && "
     "export HOME=/opt/vnstock-home && "
-    "export MINIO_ENDPOINT=http://minio:9000 && "
+    "export MINIO_ENDPOINT=http://minio:9100 && "
     "export MPLCONFIGDIR=/tmp/mplconfig-airflow"
 )
 

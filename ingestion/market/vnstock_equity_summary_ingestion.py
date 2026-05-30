@@ -32,7 +32,7 @@ _script_dir = os.path.dirname(os.path.abspath(__file__))
 for _env_path in [
     os.path.join(_script_dir, ".env"),
     os.path.join(_script_dir, "..", ".env"),
-    os.path.join(_script_dir, "..", "reference_ingestion", ".env"),
+    os.path.join(_script_dir, "..", "reference", ".env"),
 ]:
     if os.path.isfile(_env_path):
         load_dotenv(dotenv_path=_env_path)
