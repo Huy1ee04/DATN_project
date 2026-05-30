@@ -42,4 +42,5 @@ airflow/standalone_admin_password.txt
 # Test / scratch files
 test_vtit_gx.py
 vnstock_api.py
-
+# Logs
+*.log
