@@ -28,7 +28,7 @@ CLICKHOUSE_PORT = int(os.getenv('CLICKHOUSE_HTTP_PORT', '8123'))
 CLICKHOUSE_USER = os.getenv('CLICKHOUSE_USER', 'default')
 CLICKHOUSE_PASSWORD = os.getenv('CLICKHOUSE_PASSWORD', 'default')
 CLICKHOUSE_DB = os.getenv('CLICKHOUSE_DB', 'vwap')
-SYMBOLS = [s.strip() for s in os.getenv('SYMBOLS', 'HPG,SSI,VNM,VCB,TCB').split(',') if s.strip()]
+SYMBOLS = [s.strip() for s in os.getenv('SYMBOLS', 'ACB,BCM,BID,BVH,CTG,FPT,GAS,GVR,HDB,HPG,MBB,MSN,MWG,PLX,POW,SAB,SHB,SSB,SSI,STB,TCB,TPB,VCB,VHM,VIB,VIC,VJC,VNM,VPB,VRE').split(',') if s.strip()]
 REFRESH_SEC = int(os.getenv('DASHBOARD_REFRESH_SEC', '5'))
 RSI_PERIOD = int(os.getenv('RSI_PERIOD', '14'))
 

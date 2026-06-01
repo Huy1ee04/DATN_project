@@ -36,4 +36,4 @@ class Config:
     ALERT_COOLDOWN_SEC: int = int(os.getenv('ALERT_COOLDOWN_SEC', 300))
     CANDLE_BUFFER_SIZE: int = int(os.getenv('CANDLE_BUFFER_SIZE', 50))
 
-    SYMBOLS: list = os.getenv('SYMBOLS', 'HPG,SSI,VNM,VCB,TCB').split(',')
+    SYMBOLS: list = os.getenv('SYMBOLS', 'ACB,BCM,BID,BVH,CTG,FPT,GAS,GVR,HDB,HPG,MBB,MSN,MWG,PLX,POW,SAB,SHB,SSB,SSI,STB,TCB,TPB,VCB,VHM,VIB,VIC,VJC,VNM,VPB,VRE').split(',')
