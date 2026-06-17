@@ -37,7 +37,7 @@ async def main():
 
     print("Subscribing to ohlc for SSI...")
     # internal 1 3 5 15 30 1H 1D 1W
-    await client.subscribe_ohlc(
+    await client.subscribe_ohlc_closed(
         ["SSI"],
         resolution="1",
         on_ohlc=handle_ohlc,

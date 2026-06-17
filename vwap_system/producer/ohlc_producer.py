@@ -96,7 +96,7 @@ async def run(config: Config) -> None:
     await client.connect()
     logger.info(f"Connected to DNSE. Subscribing: {config.SYMBOLS}")
 
-    await client.subscribe_ohlc(
+    await client.subscribe_ohlc_closed(
         symbols=config.SYMBOLS,
         resolution=config.OHLC_RESOLUTION,
         on_ohlc=handle_ohlc,

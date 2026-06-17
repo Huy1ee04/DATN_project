@@ -2,6 +2,7 @@
 Streamlit Dashboard — Multi-Signal Alert System
 
 Real-time visualization: price + VWAP chart, RSI chart, volume chart, alert table.
+Includes Latency Monitor tab for streaming pipeline health.
 Chạy: streamlit run app.py
 """
 
@@ -28,7 +29,7 @@ CLICKHOUSE_PORT = int(os.getenv('CLICKHOUSE_HTTP_PORT', '8123'))
 CLICKHOUSE_USER = os.getenv('CLICKHOUSE_USER', 'default')
 CLICKHOUSE_PASSWORD = os.getenv('CLICKHOUSE_PASSWORD', 'default')
 CLICKHOUSE_DB = os.getenv('CLICKHOUSE_DB', 'vwap')
-SYMBOLS = [s.strip() for s in os.getenv('SYMBOLS', 'HPG,SSI,VNM,VCB,TCB').split(',') if s.strip()]
+SYMBOLS = [s.strip() for s in os.getenv('SYMBOLS', 'ACB,BCM,BID,BVH,CTG,FPT,GAS,GVR,HDB,HPG,MBB,MSN,MWG,PLX,POW,SAB,SHB,SSB,SSI,STB,TCB,TPB,VCB,VHM,VIB,VIC,VJC,VNM,VPB,VRE').split(',') if s.strip()]
 REFRESH_SEC = int(os.getenv('DASHBOARD_REFRESH_SEC', '5'))
 RSI_PERIOD = int(os.getenv('RSI_PERIOD', '14'))
 
@@ -128,9 +129,10 @@ def query_df(ch, sql: str, cols: list) -> pd.DataFrame:
 
 # ─── Data loaders ─────────────────────────────────────────────
 
-def load_ohlc_with_indicators(ch, symbol: str, minutes: int, start_time) -> pd.DataFrame:
+def load_ohlc_with_indicators(ch, symbol: str, minutes: int, start_time, selected_date) -> pd.DataFrame:
     """Tải OHLCV (1 phút) + tính running VWAP + RSI qua SQL."""
     start_time_str = start_time.strftime('%H:%M:%S')
+    date_str = selected_date.strftime('%Y-%m-%d')
     df = query_df(ch, f"""
         SELECT * FROM (
             SELECT
@@ -199,7 +201,7 @@ def load_ohlc_with_indicators(ch, symbol: str, minutes: int, start_time) -> pd.D
                 )) AS sigma
                 FROM ohlc_raw
                 WHERE symbol = '{symbol}'
-                  AND toDate(candle_time) = today()
+                  AND toDate(candle_time) = '{date_str}'
             ) t
             WHERE formatDateTime(candle_time, '%H:%M:%S') >= '{start_time_str}'
             ORDER BY time DESC
@@ -226,7 +228,9 @@ def _compute_rsi_series(closes: pd.Series, period: int = 14) -> pd.Series:
     return rsi
 
 
-def load_alerts_v2(ch, limit: int = 50, rule_filter: str = 'ALL') -> pd.DataFrame:
+def load_alerts_v2(ch, limit: int = 50, rule_filter: str = 'ALL', selected_date=None) -> pd.DataFrame:
+    date_str = selected_date.strftime('%Y-%m-%d') if selected_date else 'today()'
+    date_cond = f"toDate(alert_time) = '{date_str}'" if selected_date else "toDate(alert_time) = today()"
     where = ""
     if rule_filter != 'ALL':
         where = f"AND rule_name = '{rule_filter}'"
@@ -234,29 +238,33 @@ def load_alerts_v2(ch, limit: int = 50, rule_filter: str = 'ALL') -> pd.DataFram
         SELECT alert_time, symbol, rule_name, alert_type, severity,
                price, indicator_value, threshold, message
         FROM alerts_v2
-        WHERE toDate(alert_time) = today() {where}
+        WHERE {date_cond} {where}
         ORDER BY alert_time DESC
         LIMIT {limit}
     """, ['time', 'symbol', 'rule', 'type', 'severity',
           'price', 'indicator', 'threshold', 'message'])
 
 
-def load_summary(ch) -> dict:
-    candles = ch.query("SELECT count() FROM ohlc_raw WHERE toDate(candle_time) = today()").result_rows
-    # Thử alerts_v2, fallback alerts cũ
+def load_summary(ch, selected_date=None) -> dict:
+    date_str = selected_date.strftime('%Y-%m-%d') if selected_date else 'today()'
+    date_cond_candle = f"toDate(candle_time) = '{date_str}'" if selected_date else "toDate(candle_time) = today()"
+    date_cond_alert = f"toDate(alert_time) = '{date_str}'" if selected_date else "toDate(alert_time) = today()"
+    candles = ch.query(f"SELECT count() FROM ohlc_raw WHERE {date_cond_candle}").result_rows
     try:
-        alts = ch.query("SELECT count() FROM alerts_v2 WHERE toDate(alert_time) = today()").result_rows
+        alts = ch.query(f"SELECT count() FROM alerts_v2 WHERE {date_cond_alert}").result_rows
     except Exception:
-        alts = ch.query("SELECT count() FROM alerts WHERE toDate(alert_time) = today()").result_rows
+        alts = ch.query(f"SELECT count() FROM alerts WHERE {date_cond_alert}").result_rows
     return {
         'candles': candles[0][0] if candles else 0,
         'alerts': alts[0][0] if alts else 0,
     }
 
 
-def load_last_price(ch, symbol: str) -> float | None:
+def load_last_price(ch, symbol: str, selected_date=None) -> float | None:
+    date_str = selected_date.strftime('%Y-%m-%d') if selected_date else 'today()'
+    date_cond = f"toDate(candle_time) = '{date_str}'" if selected_date else "toDate(candle_time) = today()"
     rows = ch.query(
-        f"SELECT close FROM ohlc_raw WHERE symbol='{symbol}' "
+        f"SELECT close FROM ohlc_raw WHERE symbol='{symbol}' AND {date_cond} "
         f"ORDER BY candle_time DESC LIMIT 1"
     ).result_rows
     return rows[0][0] if rows else None
@@ -390,6 +398,244 @@ def style_alert_type(val: str) -> str:
     return ALERT_TYPE_COLORS.get(val, '')
 
 
+# ─── Latency Monitor ─────────────────────────────────────────
+
+def load_latency_summary(ch, window: int = 10) -> dict:
+    """Tính tổng hợp latency (avg, p50, p95, p99) trong cửa sổ N phút."""
+    rows = ch.query(f"""
+        SELECT
+            count()                                                                      AS total,
+            round(avg(date_diff('millisecond', candle_time, received_at)), 1)             AS avg_ms,
+            round(quantile(0.50)(date_diff('millisecond', candle_time, received_at)), 1)  AS p50_ms,
+            round(quantile(0.95)(date_diff('millisecond', candle_time, received_at)), 1)  AS p95_ms,
+            round(quantile(0.99)(date_diff('millisecond', candle_time, received_at)), 1)  AS p99_ms
+        FROM ohlc_raw
+        WHERE toDate(candle_time) = today()
+          AND candle_time >= now() - INTERVAL {window} MINUTE
+    """).result_rows
+    if not rows or rows[0][0] == 0:
+        return {'total': 0, 'avg_ms': 0, 'p50_ms': 0, 'p95_ms': 0, 'p99_ms': 0}
+    total, avg_ms, p50_ms, p95_ms, p99_ms = rows[0]
+    return {'total': total, 'avg_ms': avg_ms, 'p50_ms': p50_ms, 'p95_ms': p95_ms, 'p99_ms': p99_ms}
+
+
+def load_latency_current(ch) -> dict | None:
+    """Lấy latency của message gần nhất."""
+    rows = ch.query("""
+        SELECT
+            symbol,
+            candle_time,
+            received_at,
+            date_diff('millisecond', candle_time, received_at) AS latency_ms
+        FROM ohlc_raw
+        WHERE toDate(candle_time) = today()
+        ORDER BY received_at DESC
+        LIMIT 1
+    """).result_rows
+    if not rows:
+        return None
+    return {'symbol': rows[0][0], 'candle_time': rows[0][1],
+            'received_at': rows[0][2], 'latency_ms': rows[0][3]}
+
+
+def load_latency_timeseries(ch, window: int = 30) -> pd.DataFrame:
+    """Latency trung bình + p95 theo từng phút."""
+    return query_df(ch, f"""
+        SELECT
+            toStartOfMinute(received_at)                                                  AS minute,
+            count()                                                                       AS msg_count,
+            round(avg(date_diff('millisecond', candle_time, received_at)), 1)              AS avg_ms,
+            round(quantile(0.95)(date_diff('millisecond', candle_time, received_at)), 1)   AS p95_ms
+        FROM ohlc_raw
+        WHERE toDate(candle_time) = today()
+          AND candle_time >= now() - INTERVAL {window} MINUTE
+        GROUP BY minute
+        ORDER BY minute ASC
+    """, ['minute', 'msg_count', 'avg_ms', 'p95_ms'])
+
+
+def load_latency_distribution(ch, window: int = 30) -> pd.DataFrame:
+    """Phân bố latency theo nhóm (buckets)."""
+    return query_df(ch, f"""
+        SELECT
+            multiIf(
+                lat < 500,   '<500ms',
+                lat < 1000,  '500–1000ms',
+                lat < 1500,  '1000–1500ms',
+                lat < 2000,  '1500–2000ms',
+                lat < 3000,  '2000–3000ms',
+                             '>3000ms'
+            ) AS bucket,
+            count() AS cnt
+        FROM (
+            SELECT date_diff('millisecond', candle_time, received_at) AS lat
+            FROM ohlc_raw
+            WHERE toDate(candle_time) = today()
+              AND candle_time >= now() - INTERVAL {window} MINUTE
+        )
+        GROUP BY bucket
+        ORDER BY bucket ASC
+    """, ['bucket', 'count'])
+
+
+def load_throughput(ch) -> float:
+    """Messages per second trong 1 phút gần nhất."""
+    rows = ch.query("""
+        SELECT count() / 60.0
+        FROM ohlc_raw
+        WHERE toDate(candle_time) = today()
+          AND received_at >= now() - INTERVAL 1 MINUTE
+    """).result_rows
+    return round(rows[0][0], 1) if rows else 0.0
+
+
+def load_total_today(ch) -> int:
+    """Tổng message trong phiên hôm nay."""
+    rows = ch.query("""
+        SELECT count() FROM ohlc_raw WHERE toDate(candle_time) = today()
+    """).result_rows
+    return rows[0][0] if rows else 0
+
+
+def build_latency_over_time_chart(df: pd.DataFrame) -> go.Figure:
+    """Biểu đồ Latency Over Time (line chart)."""
+    fig = go.Figure()
+    if df.empty:
+        fig.update_layout(
+            paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+            height=350, title='Latency Over Time',
+        )
+        return fig
+    df['minute'] = pd.to_datetime(df['minute'])
+    fig.add_trace(go.Scatter(
+        x=df['minute'], y=df['avg_ms'], mode='lines+markers',
+        name='Avg Latency',
+        line=dict(color='#2563eb', width=2.5),
+        marker=dict(size=4),
+    ))
+    fig.add_trace(go.Scatter(
+        x=df['minute'], y=df['p95_ms'], mode='lines',
+        name='p95 Latency',
+        line=dict(color='#ef4444', width=2, dash='dash'),
+    ))
+    fig.update_layout(
+        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+        font=dict(color='#475569', family='Inter'), height=350,
+        title=dict(text='Latency Over Time', font=dict(size=16, color='#1e293b')),
+        legend=dict(
+            bgcolor='rgba(255,255,255,0.9)', bordercolor='rgba(0,0,0,0.1)',
+            borderwidth=1, orientation='h', y=1.12, x=0.5, xanchor='center',
+        ),
+        xaxis=dict(gridcolor='rgba(0,0,0,0.06)', title='Thời gian'),
+        yaxis=dict(gridcolor='rgba(0,0,0,0.06)', title='Latency (ms)'),
+        margin=dict(l=40, r=40, t=60, b=40),
+        hovermode='x unified',
+    )
+    return fig
+
+
+def build_latency_distribution_chart(df: pd.DataFrame) -> go.Figure:
+    """Biểu đồ phân bố Latency (bar chart)."""
+    # Sắp xếp đúng thứ tự bucket
+    bucket_order = ['<500ms', '500–1000ms', '1000–1500ms', '1500–2000ms', '2000–3000ms', '>3000ms']
+    colors = ['#10b981', '#34d399', '#fbbf24', '#f59e0b', '#ef4444', '#dc2626']
+    fig = go.Figure()
+    if df.empty:
+        fig.update_layout(
+            paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+            height=350, title='Latency Distribution',
+        )
+        return fig
+    # Reindex to maintain order
+    df = df.set_index('bucket').reindex(bucket_order).fillna(0).reset_index()
+    df.columns = ['bucket', 'count']
+    bar_colors = [colors[i] for i in range(len(df))]
+    fig.add_trace(go.Bar(
+        x=df['bucket'], y=df['count'],
+        marker_color=bar_colors,
+        marker_line_width=0,
+        text=df['count'].astype(int),
+        textposition='outside',
+    ))
+    fig.update_layout(
+        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+        font=dict(color='#475569', family='Inter'), height=350,
+        title=dict(text='Latency Distribution', font=dict(size=16, color='#1e293b')),
+        xaxis=dict(gridcolor='rgba(0,0,0,0.06)', title='Khoảng Latency'),
+        yaxis=dict(gridcolor='rgba(0,0,0,0.06)', title='Số messages'),
+        margin=dict(l=40, r=40, t=60, b=40),
+        showlegend=False,
+    )
+    return fig
+
+
+def render_latency_tab(ch):
+    """Render nội dung tab Latency Monitor."""
+    st.markdown(
+        '<p style="color: #64748b; font-size: 1.05rem; margin-top: -10px;">'
+        'Pipeline Health: DNSE WebSocket → Kafka → ClickHouse</p>',
+        unsafe_allow_html=True,
+    )
+
+    latency_window = st.slider(
+        'Cửa sổ phân tích (phút)', 5, 60, 30, step=5,
+        key='latency_window',
+    )
+
+    # ── Metrics Cards ──
+    current = load_latency_current(ch)
+    summary = load_latency_summary(ch, window=latency_window)
+    throughput = load_throughput(ch)
+    total_today = load_total_today(ch)
+
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+
+    if current:
+        m1.metric('⚡ Current', f"{current['latency_ms']:.0f}ms")
+    else:
+        m1.metric('⚡ Current', '—')
+    m2.metric('📊 Avg', f"{summary['avg_ms']:.0f}ms")
+    m3.metric('📈 p95', f"{summary['p95_ms']:.0f}ms")
+    m4.metric('🔺 p99', f"{summary['p99_ms']:.0f}ms")
+    m5.metric('📡 Msgs/s', f"{throughput:.1f}")
+    m6.metric('📦 Total', f"{total_today:,}")
+
+    st.divider()
+
+    # ── Charts ──
+    col_line, col_dist = st.columns(2)
+
+    with col_line:
+        df_ts = load_latency_timeseries(ch, window=latency_window)
+        st.plotly_chart(
+            build_latency_over_time_chart(df_ts),
+            use_container_width=True,
+        )
+
+    with col_dist:
+        df_dist = load_latency_distribution(ch, window=latency_window)
+        st.plotly_chart(
+            build_latency_distribution_chart(df_dist),
+            use_container_width=True,
+        )
+
+    # ── Connection status ──
+    if current:
+        last_recv = current['received_at']
+        if hasattr(last_recv, 'timestamp'):
+            age_sec = (datetime.now(ICT) - last_recv.replace(tzinfo=ICT)).total_seconds()
+        else:
+            age_sec = 999
+        if age_sec < 120:
+            st.success(f"🟢 Kết nối hoạt động — message gần nhất cách đây {age_sec:.0f}s [{current['symbol']}]")
+        elif age_sec < 300:
+            st.warning(f"🟡 Dữ liệu chậm — message gần nhất cách đây {age_sec:.0f}s [{current['symbol']}]")
+        else:
+            st.error(f"🔴 Mất kết nối — không có dữ liệu mới trong {age_sec:.0f}s")
+    else:
+        st.error('🔴 Không có dữ liệu streaming hôm nay. Kiểm tra producer + Kafka.')
+
+
 # ─── Main ─────────────────────────────────────────────────────
 
 def main():
@@ -397,79 +643,99 @@ def main():
     now_str = datetime.now(ICT).strftime('%H:%M:%S')
 
     # Sidebar
+    today = datetime.now(ICT).date()
+
     with st.sidebar:
         st.title('⚙️ Cài đặt')
         sym = st.selectbox('Mã chứng khoán', SYMBOLS)
+        st.divider()
+        st.markdown('##### 📅 Phiên giao dịch')
+        selected_date = st.date_input('Chọn ngày', value=today)
         start_time_val = st.time_input('Từ thời điểm', value=datetime.strptime('09:00', '%H:%M').time())
         minutes = st.slider('Hiển thị (số nến)', 10, 300, 300)
+        st.divider()
+        st.markdown('##### 🔔 Cảnh báo')
         alert_limit = st.slider('Số cảnh báo hiển thị', 10, 100, 30, step=5)
         rule_filter = st.selectbox(
             'Lọc theo rule',
             ['ALL', 'VWAP', 'RSI', 'VOLUME_SPIKE'],
         )
         st.divider()
-        st.caption(f'🔄 Tự làm mới mỗi {REFRESH_SEC}s')
+        is_today = (selected_date == today)
+        if is_today:
+            st.caption(f'🟢 Realtime — tự làm mới mỗi {REFRESH_SEC}s')
+        else:
+            st.caption(f'📜 Xem lịch sử — {selected_date.strftime("%d/%m/%Y")}')
         st.caption(f'🕐 {now_str} ICT')
 
     # Header
     st.title('⚡ Multi-Signal Engine')
-    st.markdown('<p style="color: #64748b; font-size: 1.1rem; margin-top: -15px;">Real-time Confluence Detection: VWAP · RSI · Volume Spike</p>', unsafe_allow_html=True)
-    st.markdown('<br>', unsafe_allow_html=True)
 
-    # Metrics
-    summary = load_summary(ch)
-    last_price = load_last_price(ch, sym)
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric('📊 Candles hôm nay', f"{summary['candles']:,}")
-    c2.metric('🚨 Alerts hôm nay', f"{summary['alerts']}")
-    c3.metric(f'💰 Giá {sym}', f'{last_price:.2f}' if last_price else '—')
-    c4.metric('⏱️ Cập nhật lúc', now_str)
+    # ── Tabs: Signal Detection | Latency Monitor ──
+    tab_signals, tab_latency = st.tabs(['📈 Signal Detection', '📡 Latency Monitor'])
 
-    st.divider()
+    with tab_signals:
+        st.markdown('<p style="color: #64748b; font-size: 1.1rem; margin-top: -5px;">Real-time Confluence Detection: VWAP · RSI · Volume Spike</p>', unsafe_allow_html=True)
 
-    # Layout chính: trái = multi-chart, phải = bảng cảnh báo
-    col_chart, col_alerts = st.columns([2, 1])
+        # Metrics
+        date_label = 'Hôm nay' if is_today else selected_date.strftime('%d/%m/%Y')
+        summary = load_summary(ch, selected_date)
+        last_price = load_last_price(ch, sym, selected_date)
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric(f'📊 Candles ({date_label})', f"{summary['candles']:,}")
+        c2.metric(f'🚨 Alerts ({date_label})', f"{summary['alerts']}")
+        c3.metric(f'💰 Giá {sym}', f'{last_price:.2f}' if last_price else '—')
+        c4.metric('⏱️ Cập nhật lúc', now_str)
 
-    with col_chart:
-        df = load_ohlc_with_indicators(ch, sym, minutes, start_time_val)
-        st.plotly_chart(build_multi_chart(df, sym), use_container_width=True)
+        st.divider()
 
-        # RSI + Volume ratio hiện tại
-        if not df.empty:
-            rsi_now = df['rsi'].iloc[-1] if 'rsi' in df.columns else None
-            vol_avg_20 = df['quantity'].tail(21).head(20).mean()
-            vol_current = df['quantity'].iloc[-1]
-            vol_ratio = vol_current / vol_avg_20 if vol_avg_20 > 0 else 0
+        # Layout chính: trái = multi-chart, phải = bảng cảnh báo
+        col_chart, col_alerts = st.columns([2, 1])
 
-            r1, r2, r3 = st.columns(3)
-            if rsi_now and not pd.isna(rsi_now):
-                rsi_color = '🔴' if rsi_now > 70 else ('🟢' if rsi_now < 30 else '⚪')
-                r1.metric(f'{rsi_color} RSI({RSI_PERIOD})', f'{rsi_now:.1f}')
+        with col_chart:
+            df = load_ohlc_with_indicators(ch, sym, minutes, start_time_val, selected_date)
+            st.plotly_chart(build_multi_chart(df, sym), use_container_width=True)
+
+            # RSI + Volume ratio hiện tại
+            if not df.empty:
+                rsi_now = df['rsi'].iloc[-1] if 'rsi' in df.columns else None
+                vol_avg_20 = df['quantity'].tail(21).head(20).mean()
+                vol_current = df['quantity'].iloc[-1]
+                vol_ratio = vol_current / vol_avg_20 if vol_avg_20 > 0 else 0
+
+                r1, r2, r3 = st.columns(3)
+                if rsi_now and not pd.isna(rsi_now):
+                    rsi_color = '🔴' if rsi_now > 70 else ('🟢' if rsi_now < 30 else '⚪')
+                    r1.metric(f'{rsi_color} RSI({RSI_PERIOD})', f'{rsi_now:.1f}')
+                else:
+                    r1.metric(f'RSI({RSI_PERIOD})', '—')
+                vol_color = '🔴' if vol_ratio >= 3.0 else '⚪'
+                r2.metric(f'{vol_color} Vol Ratio', f'{vol_ratio:.1f}x')
+                vwap_now = df['vwap'].iloc[-1] if 'vwap' in df.columns else None
+                r3.metric('📐 VWAP', f'{vwap_now:.2f}' if vwap_now else '—')
+
+        with col_alerts:
+            st.markdown('<h3 style="margin-top: 0; padding-bottom: 10px; font-weight: 700; color: #1e293b;">🚨 Tín hiệu gần nhất</h3>', unsafe_allow_html=True)
+            df_alerts = load_alerts_v2(ch, limit=alert_limit, rule_filter=rule_filter, selected_date=selected_date)
+            if df_alerts.empty:
+                st.info('Chưa có cảnh báo nào trong phiên.')
             else:
-                r1.metric(f'RSI({RSI_PERIOD})', '—')
-            vol_color = '🔴' if vol_ratio >= 3.0 else '⚪'
-            r2.metric(f'{vol_color} Vol Ratio', f'{vol_ratio:.1f}x')
-            vwap_now = df['vwap'].iloc[-1] if 'vwap' in df.columns else None
-            r3.metric('📐 VWAP', f'{vwap_now:.2f}' if vwap_now else '—')
+                df_alerts['price'] = df_alerts['price'].map(lambda x: f'{x:.2f}')
+                df_alerts['indicator'] = df_alerts['indicator'].map(lambda x: f'{x:.2f}')
+                styled = (
+                    df_alerts.style
+                    .map(style_alert_type, subset=['type'])
+                    .map(style_severity, subset=['severity'])
+                )
+                st.dataframe(styled, use_container_width=True, hide_index=True)
 
-    with col_alerts:
-        st.markdown('<h3 style="margin-top: 0; padding-bottom: 10px; font-weight: 700; color: #1e293b;">🚨 Tín hiệu gần nhất</h3>', unsafe_allow_html=True)
-        df_alerts = load_alerts_v2(ch, limit=alert_limit, rule_filter=rule_filter)
-        if df_alerts.empty:
-            st.info('Chưa có cảnh báo nào trong phiên.')
-        else:
-            df_alerts['price'] = df_alerts['price'].map(lambda x: f'{x:.2f}')
-            df_alerts['indicator'] = df_alerts['indicator'].map(lambda x: f'{x:.2f}')
-            styled = (
-                df_alerts.style
-                .map(style_alert_type, subset=['type'])
-                .map(style_severity, subset=['severity'])
-            )
-            st.dataframe(styled, use_container_width=True, hide_index=True)
+    with tab_latency:
+        render_latency_tab(ch)
 
-    # Auto refresh
-    time.sleep(REFRESH_SEC)
-    st.rerun()
+    # Auto refresh only for today (realtime mode)
+    if is_today:
+        time.sleep(REFRESH_SEC)
+        st.rerun()
 
 
 if __name__ == '__main__':

@@ -17,6 +17,7 @@ from vwap import VWAPCalculator, ICT
 from candle_buffer import CandleBuffer, Candle
 from models import Alert
 from config import Config
+from slack_notifier import SlackNotifier
 
 # Cảnh báo đơn lẻ (tạm comment — dùng Combined rule thay thế)
 # from rules.vwap_rule import VWAPRule
@@ -62,6 +63,9 @@ class AlertDetector:
         ]
         rule_names = [r.RULE_NAME for r in self.rules]
         logger.info(f"Registered rules: {rule_names}")
+
+        # Slack notifier (chỉ gửi CRITICAL)
+        self.slack = SlackNotifier()
 
         self._warm_up()
 
@@ -273,6 +277,9 @@ class AlertDetector:
                 )
             except Exception:
                 pass  # alerts cũ không quan trọng nếu fail
+
+        # Gửi Slack nếu CRITICAL
+        self.slack.send_alert(alert)
 
     def _process_candle(
         self, symbol: str, ts: datetime,

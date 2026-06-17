@@ -21,4 +21,4 @@ class Config:
     OHLC_RESOLUTION: str = os.getenv('OHLC_RESOLUTION', '1')
 
     # Danh sách mã chứng khoán cần theo dõi
-    SYMBOLS: list = os.getenv('SYMBOLS', 'HPG,SSI,VNM,VCB,TCB').split(',')
+    SYMBOLS: list = os.getenv('SYMBOLS', 'ACB,BCM,BID,BVH,CTG,FPT,GAS,GVR,HDB,HPG,MBB,MSN,MWG,PLX,POW,SAB,SHB,SSB,SSI,STB,TCB,TPB,VCB,VHM,VIB,VIC,VJC,VNM,VPB,VRE').split(',')
