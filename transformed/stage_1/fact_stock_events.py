@@ -5,12 +5,11 @@ fact_stock_events.py
 Transform: đọc toàn bộ partition events, chỉ giữ các trường cần thiết.
 
 Source (MinIO):
-  raw/reference/company/events/  → symbol, event_title, event_list_name,
-                                     public_date (ngày công bố),
-                                     issue_date  (ngày hiệu lực)
+  raw/reference/company/events/  → ticker, event_name_vi, event_title_vi,
+                                     event_code, public_date
 
 Output (MinIO):
-  transformed/fact/fact_stock_events.parquet
+  transformed/stage_1/fact/fact_stock_events.parquet
 """
 
 import io
@@ -23,6 +22,11 @@ from typing import Optional
 import polars as pl
 import s3fs
 from dotenv import load_dotenv
+
+from vtit_gx.polars import (
+    gx_check_columns_not_null,
+    gx_check_table_row_count_between,
+)
 
 # ── Load .env ────────────────────────────────────────────────────────────────
 _script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -51,15 +55,22 @@ MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minio_secret_key")
 DEFAULT_BUCKET   = os.getenv("MINIO_BUCKET", "stock-data")
 
 SRC_PREFIX   = "raw/reference/company/events"
-DST_PREFIX   = "transformed/fact"
+DST_PREFIX   = "transformed/stage_1/fact"
 DST_FILENAME = "fact_stock_events.parquet"
 
 SELECT_COLS = [
-    "symbol",
-    "event_title",
-    "event_list_name",
+    "ticker",
+    "event_name_vi",
+    "event_title_vi",
+    "event_code",
     "public_date",
-    "issue_date",
+]
+OUTPUT_COLS = [
+    "symbol",
+    "event_name_vi",
+    "event_title_vi",
+    "event_code",
+    "public_date",
 ]
 
 
@@ -119,10 +130,10 @@ def write_parquet(
     df: pl.DataFrame,
     fs: s3fs.S3FileSystem,
     s3_path: str,
-    overwrite: bool = False,
+    overwrite: bool = True,
 ) -> None:
     if fs.exists(s3_path) and not overwrite:
-        logger.info(f"Exists, skipping: s3://{s3_path}  (dùng --overwrite để ghi đè)")
+        logger.info(f"Exists, skipping: s3://{s3_path}")
         return
     buf = io.BytesIO()
     df.write_parquet(buf, compression="snappy")
@@ -136,24 +147,35 @@ def write_parquet(
 # ── Transform ─────────────────────────────────────────────────────────────────
 
 def transform(df: pl.DataFrame) -> pl.DataFrame:
-    """Cast các cột ngày về kiểu Date, thêm updated_at."""
-    for col in ("public_date", "issue_date"):
-        if col not in df.columns:
-            continue
-        dtype = df[col].dtype
-        if dtype == pl.Date:
-            pass
-        elif dtype in (pl.Int64, pl.Int32, pl.UInt64, pl.UInt32):
-            df = df.with_columns(
-                pl.from_epoch(pl.col(col), time_unit="ms").cast(pl.Date)
-            )
-        elif dtype in (pl.Datetime, pl.Datetime("ms"), pl.Datetime("us"), pl.Datetime("ns")):
-            df = df.with_columns(pl.col(col).cast(pl.Date))
-        elif dtype in (pl.Utf8, pl.String):
-            df = df.with_columns(pl.col(col).str.to_date(format="%Y-%m-%d", strict=False))
+    """Rename ticker → symbol, cast public_date về Date, chỉ giữ output columns."""
+    missing_cols = sorted(set(SELECT_COLS) - set(df.columns))
+    if missing_cols:
+        raise ValueError(f"Missing required columns: {missing_cols}")
 
-    updated_at = datetime.now(ICT).strftime("%Y-%m-%dT%H:%M:%S%z")
-    return df.with_columns(pl.lit(updated_at).alias("updated_at"))
+    df = df.rename({"ticker": "symbol"})
+
+    dtype = df["public_date"].dtype
+    if dtype == pl.Date:
+        pass
+    elif dtype in (pl.Int64, pl.Int32, pl.UInt64, pl.UInt32):
+        df = df.with_columns(pl.from_epoch(pl.col("public_date"), time_unit="ms").cast(pl.Date))
+    elif dtype in (pl.Datetime, pl.Datetime("ms"), pl.Datetime("us"), pl.Datetime("ns")):
+        df = df.with_columns(pl.col("public_date").cast(pl.Date))
+    elif dtype in (pl.Utf8, pl.String):
+        df = df.with_columns(
+            pl.col("public_date")
+            .cast(pl.Utf8, strict=False)
+            .str.slice(0, 10)
+            .str.to_date(format="%Y-%m-%d", strict=False)
+        )
+
+    return (
+        df.select(OUTPUT_COLS)
+        .drop_nulls(["symbol"])
+        .with_columns(pl.col("symbol").cast(pl.Utf8).str.strip_chars().str.to_uppercase())
+        .filter(pl.col("symbol") != "")
+        .unique()
+    )
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -163,7 +185,11 @@ def parse_args() -> argparse.Namespace:
         description="Transform: events → fact_stock_events."
     )
     p.add_argument("--bucket",    default=DEFAULT_BUCKET, help="MinIO bucket")
-    p.add_argument("--overwrite", action="store_true",    help="Ghi đè output nếu đã tồn tại")
+    p.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Bỏ qua nếu output đã tồn tại. Mặc định là ghi đè.",
+    )
     return p.parse_args()
 
 
@@ -177,7 +203,7 @@ def log_run_info(args: argparse.Namespace, bucket: str) -> None:
         "Source         : s3://%s/%s/\n"
         "Columns        : %s\n"
         "Destination    : s3://%s/%s/%s\n"
-        "Overwrite      : %s\n"
+        "Mode           : %s\n"
         "Run at         : %s\n%s",
         separator, separator,
         MINIO_ENDPOINT,
@@ -185,7 +211,7 @@ def log_run_info(args: argparse.Namespace, bucket: str) -> None:
         bucket, SRC_PREFIX,
         SELECT_COLS,
         bucket, DST_PREFIX, DST_FILENAME,
-        args.overwrite,
+        "skip existing" if args.skip_existing else "overwrite",
         run_at,
         separator,
     )
@@ -205,8 +231,14 @@ def main() -> None:
 
     df_result = transform(df)
 
+    # ── GX Gate: Basic quality check after cleaning ───────────────────
+    logger.info("Running GX validation (Stage 1: BK not-null + Volume)...")
+    gx_check_columns_not_null(df_result, {"columns": ["symbol", "event_code"]})
+    gx_check_table_row_count_between(df_result, {"min_value": 1})
+    logger.info("GX validation passed ✓")
+
     dst_path = f"{bucket}/{DST_PREFIX}/{DST_FILENAME}"
-    write_parquet(df_result, fs, dst_path, overwrite=args.overwrite)
+    write_parquet(df_result, fs, dst_path, overwrite=not args.skip_existing)
 
     separator = "=" * 80
     logger.info("\n%s\nfact_stock_events transform complete!\n%s", separator, separator)

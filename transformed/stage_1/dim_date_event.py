@@ -5,13 +5,13 @@ dim_date_event_transform.py
 Transform: left join date dimension với market events.
 
 Input (MinIO):
-  raw/date_2024_2026.parquet          → bảng ngày (date dimension)
+  raw/reference/event/date_2024_2026.parquet          → bảng ngày (date dimension)
   raw/reference/event/event.parquet   → market events
 
 Join: left join on key "date"
 
 Output (MinIO):
-  transformed/dimension/dim_date_event.parquet
+  transformed/stage_1/dimension/dim_date_event.parquet
   (không giữ ingested_at từ raw;
    cột week → cal_week; event_type → is_holiday (1 nếu event_type có giá trị, 0 nếu không);
    is_holiday + is_weekend → is_day_off; event_name cuối tuần → 'Cuối tuần';
@@ -55,9 +55,9 @@ MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minio_access_key")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minio_secret_key")
 DEFAULT_BUCKET   = os.getenv("MINIO_BUCKET", "stock-data")
 
-SRC_DATE_PATH  = "raw/date_2024_2026.parquet"
+SRC_DATE_PATH  = "raw/reference/event/date_2024_2026.parquet"
 SRC_EVENT_PATH = "raw/reference/event/event.parquet"
-DST_PREFIX     = "transformed/dimension"
+DST_PREFIX     = "transformed/stage_1/dimension"
 DST_FILENAME   = "dim_date_event.parquet"
 
 JOIN_KEY = "date"
@@ -116,7 +116,7 @@ def transform(
     Sau join: bỏ cột ingested_at từ nguồn (nếu có); đổi week → cal_week; thay event_type
     bằng is_holiday (1 khi event_type khác null và khác chuỗi rỗng sau trim, 0 ngược lại);
     gộp is_holiday và is_weekend thành is_day_off; event_name ngày cuối tuần ghi 'Cuối tuần';
-    bỏ duration.
+    bỏ duration, day_of_week, day_name, month_name, event_code (thừa hoặc suy ra từ date).
     """
     # Đảm bảo cột join cùng kiểu dữ liệu (Date)
     # Xử lý nhiều trường hợp kiểu dữ liệu của cột date trong parquet nguồn:
@@ -160,6 +160,12 @@ def transform(
     if "week" in df_joined.columns:
         df_joined = df_joined.rename({"week": "cal_week"})
 
+    # Thêm cal_year (nhất quán với cal_week, cal_month, cal_quarter)
+    if "cal_year" not in df_joined.columns:
+        df_joined = df_joined.with_columns(
+            pl.col(JOIN_KEY).dt.year().cast(pl.Int64).alias("cal_year")
+        )
+
     if "event_type" in df_joined.columns:
         et = pl.col("event_type")
         df_joined = df_joined.with_columns(
@@ -198,8 +204,12 @@ def transform(
         .alias("is_day_off")
     ).drop("is_holiday", "is_weekend")
 
-    if "duration" in df_joined.columns:
-        df_joined = df_joined.drop("duration")
+    # Bỏ các cột thừa (suy ra từ date nếu cần, hoặc không dùng)
+    drop_cols = [c for c in ("duration", "day_of_week", "day_name", "month_name", "event_code")
+                 if c in df_joined.columns]
+    if drop_cols:
+        df_joined = df_joined.drop(drop_cols)
+        logger.info(f"Dropped unnecessary columns: {drop_cols}")
 
     logger.info(
         f"Join result: {df_joined.shape[0]:,} rows × {df_joined.shape[1]} cols"

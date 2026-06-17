@@ -1,23 +1,20 @@
 #!/usr/bin/env python3
 """
-dim_master_event.py
+dim_master_index.py
 
 Đưa dữ liệu từ layer transformed (stage_2) lên master (dimension).
-Thêm surrogate key theo phương pháp Kimball.
+Pure SCD Type 1 theo Kimball: overwrite toàn bộ dimension mỗi lần chạy.
 
 Source (MinIO):
-  transformed/stage_2/dimension/dim_date_event.parquet
+  transformed/stage_2/dimension/dim_index_info.parquet
 
 Destination (MinIO):
-  master/dimension/dim_master_event.parquet
+  master/dimension/dim_master_index.parquet
 
 Logic publish:
   - Đọc dữ liệu đã conform từ stage_2.
-  - Thêm surrogate key `date_key` dạng Int32 (yyyymmdd), ví dụ: 20240101.
-    Đây là "smart key" theo Kimball — vừa là surrogate key, vừa có ý nghĩa
-    business, phù hợp với date dimension.
-  - Đặt `date_key` làm cột đầu tiên (PK position).
-  - Sắp xếp theo date_key tăng dần.
+  - Surrogate key: `index_key` = `index_id` (đã là meaningless Int64 từ source).
+  - SCD Type 1: ghi đè toàn bộ master mỗi lần chạy (full refresh).
 """
 
 import io
@@ -49,7 +46,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-logger = logging.getLogger("dim_master_event_publish")
+logger = logging.getLogger("dim_master_index_publish")
 ICT = timezone(timedelta(hours=7))
 
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://localhost:9100")
@@ -60,10 +57,16 @@ MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minio_access_key")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minio_secret_key")
 DEFAULT_BUCKET = os.getenv("MINIO_BUCKET", "stock-data")
 
-SRC_PATH = "transformed/stage_2/dimension/dim_date_event.parquet"
+SRC_PATH = "transformed/stage_2/dimension/dim_index_info.parquet"
 DST_PREFIX = "master/dimension"
-DST_FILENAME = "dim_master_event.parquet"
+DST_FILENAME = "dim_master_index.parquet"
 
+# Surrogate key (dùng index_id vì đã là meaningless integer)
+SURROGATE_KEY = "index_key"
+NATURAL_KEY = "index_id"
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _build_fs() -> s3fs.S3FileSystem:
     return s3fs.S3FileSystem(
@@ -85,11 +88,7 @@ def write_parquet(
     df: pl.DataFrame,
     fs: s3fs.S3FileSystem,
     s3_path: str,
-    overwrite: bool = False,
 ) -> None:
-    if fs.exists(s3_path) and not overwrite:
-        logger.info(f"Exists, skipping: s3://{s3_path}  (dùng --overwrite để ghi đè)")
-        return
     buf = io.BytesIO()
     df.write_parquet(buf, compression="snappy")
     buf.seek(0)
@@ -99,45 +98,25 @@ def write_parquet(
     logger.info(f"Saved s3://{s3_path} ({size_kb:.1f} KB, {df.shape[0]:,} rows)")
 
 
-# ── Transform: thêm surrogate key ───────────────────────────────────────────
+# ── Transform: surrogate key ────────────────────────────────────────────────
 
 def add_surrogate_key(df: pl.DataFrame) -> pl.DataFrame:
     """
-    Thêm surrogate key `date_key` (Int32) theo Kimball.
-
-    Công thức: date_key = year * 10000 + month * 100 + day
-    Ví dụ: 2024-01-15 → 20240115
-
-    - Đặt `date_key` làm cột đầu tiên.
-    - Sort theo date_key tăng dần.
+    Surrogate key cho dim_index: dùng index_id trực tiếp (đã là meaningless integer).
+    Đặt index_key làm cột đầu tiên.
     """
-    if "trade_date" not in df.columns:
-        raise ValueError("Cột 'trade_date' không tồn tại — không thể tạo surrogate key.")
+    if NATURAL_KEY not in df.columns:
+        raise ValueError(f"Cột '{NATURAL_KEY}' không tồn tại — không thể tạo surrogate key.")
 
-    # Đảm bảo cột trade_date là kiểu Date
-    if df["trade_date"].dtype != pl.Date:
-        df = df.with_columns(pl.col("trade_date").cast(pl.Date))
-
-    # Tạo date_key = yyyymmdd dạng Int32
-    # Lưu ý: dt.month() và dt.day() trả về Int8 → phải cast Int32 trước khi nhân
     df = df.with_columns(
-        (
-            pl.col("trade_date").dt.year().cast(pl.Int32) * 10_000
-            + pl.col("trade_date").dt.month().cast(pl.Int32) * 100
-            + pl.col("trade_date").dt.day().cast(pl.Int32)
-        )
-        .alias("date_key")
+        pl.col(NATURAL_KEY).cast(pl.Int64).alias(SURROGATE_KEY)
     )
 
-    # Đưa date_key lên đầu, giữ nguyên thứ tự các cột còn lại
-    col_order = ["date_key"] + [c for c in df.columns if c != "date_key"]
+    # Đưa surrogate key lên đầu, bỏ cột natural key gốc (tránh duplicate)
+    col_order = [SURROGATE_KEY] + [c for c in df.columns if c not in (SURROGATE_KEY, NATURAL_KEY)]
     df = df.select(col_order)
 
-    # Sort theo date_key
-    df = df.sort("date_key")
-
-    logger.info(f"Added surrogate key `date_key` (Int32, yyyymmdd). "
-                f"Range: {df['date_key'].min()} → {df['date_key'].max()}")
+    logger.info(f"Added surrogate key `{SURROGATE_KEY}` (Int64, = {NATURAL_KEY}).")
     return df
 
 
@@ -145,33 +124,11 @@ def add_surrogate_key(df: pl.DataFrame) -> pl.DataFrame:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Publish dim_date_event (stage_2) → master/dimension/dim_master_event (+ surrogate key)"
+        description="Publish dim_index_info (stage_2) → master/dimension/dim_master_index (SCD Type 1)"
     )
     p.add_argument("--bucket", default=DEFAULT_BUCKET, help="MinIO bucket")
     p.add_argument("--overwrite", action="store_true", help="Ghi đè file master nếu đã tồn tại")
     return p.parse_args()
-
-
-def log_run_info(args: argparse.Namespace, src: str, dst: str) -> None:
-    separator = "=" * 80
-    run_at = datetime.now(ICT).strftime("%Y-%m-%d %H:%M:%S %Z")
-    logger.info(
-        "\n%s\nPublish: dim_date_event (stage_2) → master/dimension/dim_master_event\n%s\n"
-        "MinIO Endpoint : %s\n"
-        "Bucket         : %s\n"
-        "Source         : s3://%s\n"
-        "Destination    : s3://%s\n"
-        "Overwrite      : %s\n"
-        "Run at         : %s\n"
-        "Surrogate key  : date_key (Int32, yyyymmdd)\n%s",
-        separator, separator,
-        MINIO_ENDPOINT,
-        args.bucket,
-        src, dst,
-        args.overwrite,
-        run_at,
-        separator,
-    )
 
 
 def main() -> None:
@@ -179,7 +136,26 @@ def main() -> None:
     bucket = args.bucket
     src = f"{bucket}/{SRC_PATH}"
     dst = f"{bucket}/{DST_PREFIX}/{DST_FILENAME}"
-    log_run_info(args, src, dst)
+
+    separator = "=" * 80
+    run_at = datetime.now(ICT).strftime("%Y-%m-%d %H:%M:%S %Z")
+    logger.info(
+        "\n%s\nPublish: dim_index_info (stage_2) → master/dimension/dim_master_index\n%s\n"
+        "MinIO Endpoint : %s\n"
+        "Bucket         : %s\n"
+        "Source         : s3://%s\n"
+        "Destination    : s3://%s\n"
+        "Run at         : %s\n"
+        "SCD Type       : Type 1 (full refresh)\n"
+        "Surrogate key  : %s (Int64, = %s)\n%s",
+        separator, separator,
+        MINIO_ENDPOINT,
+        args.bucket,
+        src, dst,
+        run_at,
+        SURROGATE_KEY, NATURAL_KEY,
+        separator,
+    )
 
     fs = _build_fs()
     if not fs.exists(src):
@@ -191,23 +167,25 @@ def main() -> None:
         logger.error("Source is empty — aborting.")
         return
 
-    # Thêm surrogate key theo Kimball
+    # 1. Thêm surrogate key
     df = add_surrogate_key(df)
+
+    # 2. Sort theo surrogate key
+    df = df.sort(SURROGATE_KEY)
 
     logger.info(f"Final schema: {df.schema}")
     logger.info(f"Sample:\n{df.head(5)}")
 
     # ── GX Gate: Star Schema Integrity ─────────────────────────────
     logger.info("Running GX validation (Master: SK unique + not null)...")
-    gx_check_column_not_null(df, {"column": "date_key"})
-    gx_check_column_values_unique(df, {"column": "date_key"})
+    gx_check_column_not_null(df, {"column": "index_key"})
+    gx_check_column_values_unique(df, {"column": "index_key"})
     gx_check_table_row_count_between(df, {"min_value": 1})
     logger.info("GX validation passed ✓")
 
-    write_parquet(df, fs, dst, overwrite=args.overwrite)
+    write_parquet(df, fs, dst)  # SCD1: luôn full refresh
 
-    separator = "=" * 80
-    logger.info("\n%s\ndim_master_event publish complete!\n%s", separator, separator)
+    logger.info("\n%s\ndim_master_index publish complete!\n%s", separator, separator)
 
 
 if __name__ == "__main__":

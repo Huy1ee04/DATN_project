@@ -2,54 +2,51 @@
 """
 vnstock_equity_summary_ingestion.py
 
-Fetch Market().equity(symbol).summary() for all symbols in
-raw/reference/equity/equity.parquet and save to MinIO S3 as one Parquet file.
+Fetch Market().equity(symbol).summary() for HOSE/STOCK symbols and write to MinIO.
 
-Target structure in MinIO:
-  raw/market/
-    equity/summary.parquet
+Target (partitioned by date, co-located with ohlc.parquet):
+  raw/market/equity/year=YYYY/month=MM/day=DD/summary.parquet
 
-Behavior:
- - By default skips run if summary.parquet already exists (no --append).
- - Use --append to merge with existing file, deduplicated by symbol (new rows win).
- - Skips symbols that return empty / no data.
- - Retries on rate-limit / timeout with same backoff pattern as OHLC ingestion.
+Each row includes ``date`` = trading date (YYYY-MM-DD). When run from Airflow,
+pass ``--date`` (typically ``next_ds``). Without ``--date``, defaults to today (ICT).
+Uses --append to merge with existing file in the same partition, dedup by symbol.
 """
 
+from __future__ import annotations
+
+import argparse
+import logging
 import os
 import time
-import logging
-import argparse
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 import polars as pl
 import s3fs
 from dotenv import load_dotenv
+from vnstock_data import Market
 from vtit_gx.polars.gx_schema_validity import gx_check_columns_to_match_set
 
 _script_dir = os.path.dirname(os.path.abspath(__file__))
-for _env_path in [
+for _env_path in (
     os.path.join(_script_dir, ".env"),
     os.path.join(_script_dir, "..", ".env"),
     os.path.join(_script_dir, "..", "reference", ".env"),
-]:
+):
     if os.path.isfile(_env_path):
         load_dotenv(dotenv_path=_env_path)
         break
 
-from vnstock_data import Market
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("equity_summary_ingestion")
+logger = logging.getLogger("hose_summary_daily_ingestion")
 ICT = timezone(timedelta(hours=7))
 
 vnstock_key = os.getenv("VNSTOCK_API_KEY")
 if vnstock_key:
     os.environ["VNSTOCK_API_KEY"] = vnstock_key
-    logger.info(f"VNStock API Key ('{vnstock_key[:4]}***') found and configured successfully (Sponsor tier active).")
+    logger.info("VNStock API Key ('%s***') configured.", vnstock_key[:4])
 else:
-    logger.warning("No VNSTOCK_API_KEY found in environment or .env, running on Community tier.")
+    logger.warning("No VNSTOCK_API_KEY — running on Community tier.")
 
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://localhost:9100")
 if not MINIO_ENDPOINT.startswith("http"):
@@ -64,8 +61,8 @@ DEFAULT_MARKET_PREFIX = "raw/market"
 SUMMARY_PER_REQ_DELAY = 0.33
 WAIT_TIME_ON_ERROR = 65
 BATCH_LOG_SIZE = 50
-EQUITY_SUMMARY_EXPECTED_COLUMNS = (
-    "symbol",
+
+SUMMARY_METRIC_COLUMNS = (
     "high_52w",
     "low_52w",
     "dividend",
@@ -81,114 +78,37 @@ EQUITY_SUMMARY_EXPECTED_COLUMNS = (
     "dividend_yield",
     "foreign_ownership_pct",
 )
+SUMMARY_DAILY_EXPECTED_COLUMNS = ("symbol", "date", *SUMMARY_METRIC_COLUMNS, "ingested_at")
 
 
-def _add_ingested_at(df: pd.DataFrame) -> pd.DataFrame:
+def _decode_bytes(value):
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="ignore")
+    return value
+
+
+def _normalize_output_schema(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df["ingested_at"] = datetime.now(ICT)
-    return df
+
+    for column in SUMMARY_DAILY_EXPECTED_COLUMNS:
+        if column not in df.columns:
+            df[column] = pd.NA
+
+    df["symbol"] = df["symbol"].map(_decode_bytes).astype(str).str.strip().str.upper()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+
+    for column in SUMMARY_METRIC_COLUMNS:
+        df[column] = df[column].map(_decode_bytes)
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+
+    # ingested_at sẽ được gán riêng trước khi write, giữ nguyên nếu đã có
+    if "ingested_at" not in df.columns:
+        df["ingested_at"] = pd.NaT
+
+    return df.loc[:, SUMMARY_DAILY_EXPECTED_COLUMNS]
 
 
-def _write_parquet_and_log(
-    df: pd.DataFrame,
-    fs: s3fs.S3FileSystem,
-    s3_path: str,
-    success_prefix: str = "Uploaded",
-) -> None:
-    with fs.open(s3_path, "wb") as fh:
-        df.to_parquet(fh, engine="pyarrow", index=False, compression="snappy")
-    size_kb = (fs.size(s3_path) or 0) / 1024
-    logger.info(f"{success_prefix} s3://{s3_path} ({size_kb:.1f} KB, {len(df):,} rows)")
-
-
-def write_parquet_to_s3(df: pd.DataFrame, fs: s3fs.S3FileSystem, s3_path: str) -> None:
-    if df is None or df.empty:
-        logger.warning(f"DataFrame is empty, skipping upload for {s3_path}")
-        return
-    if fs.exists(s3_path):
-        logger.info(f"Exists, skipping: s3://{s3_path}  (use --append to merge)")
-        return
-    df = _add_ingested_at(df)
-    _write_parquet_and_log(df, fs, s3_path, success_prefix="Uploaded")
-
-
-def append_parquet_to_s3(
-    df_new: pd.DataFrame,
-    fs: s3fs.S3FileSystem,
-    s3_path: str,
-    dedup_keys: list[str] | None = None,
-) -> None:
-    if df_new is None or df_new.empty:
-        logger.warning(f"New DataFrame is empty, nothing to append for {s3_path}")
-        return
-
-    if dedup_keys is None:
-        dedup_keys = ["symbol"]
-
-    df_new = _add_ingested_at(df_new)
-
-    if fs.exists(s3_path):
-        try:
-            with fs.open(s3_path, "rb") as f:
-                df_old = pd.read_parquet(f)
-            logger.info(f"Read existing file: {len(df_old):,} rows from s3://{s3_path}")
-            df_combined = pd.concat([df_new, df_old], ignore_index=True)
-        except Exception as e:
-            logger.error(f"Cannot read existing parquet ({e}), will overwrite with new data.")
-            df_combined = df_new
-    else:
-        logger.info(f"File not found, creating new: s3://{s3_path}")
-        df_combined = df_new
-
-    before = len(df_combined)
-    valid_keys = [k for k in dedup_keys if k in df_combined.columns]
-    if valid_keys:
-        df_combined = df_combined.drop_duplicates(subset=valid_keys, keep="first")
-    after = len(df_combined)
-    if before != after:
-        logger.info(f"Dedup: {before - after:,} duplicate rows removed → {after:,} rows kept")
-
-    _write_parquet_and_log(df_combined, fs, s3_path, success_prefix="Appended ->")
-
-
-def read_symbols_from_equity_parquet(fs: s3fs.S3FileSystem, equity_s3_path: str) -> list[str]:
-    if not fs.exists(equity_s3_path):
-        logger.error(f"Missing equity parquet: s3://{equity_s3_path}")
-        return []
-
-    try:
-        with fs.open(equity_s3_path, "rb") as f:
-            df_equity = pd.read_parquet(f)
-    except Exception as e:
-        logger.error(f"Cannot read equity parquet: {e}")
-        return []
-
-    if "symbol" not in df_equity.columns:
-        logger.error("equity.parquet has no 'symbol' column.")
-        return []
-
-    symbols = (
-        df_equity["symbol"]
-        .astype(str)
-        .str.strip()
-        .str.upper()
-        .replace("", pd.NA)
-        .dropna()
-        .drop_duplicates()
-        .tolist()
-    )
-    logger.info(f"Loaded {len(symbols)} symbols from s3://{equity_s3_path}")
-    return symbols
-
-
-def _normalize_summary_to_df(symbol: str, summary) -> pd.DataFrame | None:
-    """
-    Chuẩn hóa kết quả summary() thành DataFrame có cột ``symbol``.
-
-    Kiểm tra thư viện (vnstock_data / KBS): ``summary()`` trả về ``pd.DataFrame([payload])``;
-    mã thường gắn ở ``df.attrs['symbol']``, payload JSON có thể *không* có cột ``symbol``.
-    Nếu API đã có cột ``symbol`` thì chỉ chuẩn hóa chữ hoa / điền ô trống bằng mã request.
-    """
+def _normalize_summary(symbol: str, summary) -> pd.DataFrame | None:
     if summary is None:
         return None
     if isinstance(summary, pd.Series):
@@ -208,118 +128,215 @@ def _normalize_summary_to_df(symbol: str, summary) -> pd.DataFrame | None:
     if "symbol" not in df.columns:
         attrs = getattr(df, "attrs", None) or {}
         attr_sym = attrs.get("symbol") if isinstance(attrs, dict) else None
-        if attr_sym is not None and str(attr_sym).strip():
-            use_sym = str(attr_sym).strip().upper()
-        else:
-            use_sym = str(symbol).strip().upper()
+        use_sym = str(attr_sym).strip().upper() if attr_sym else str(symbol).strip().upper()
         df.insert(0, "symbol", use_sym)
     else:
-        df["symbol"] = df["symbol"].where(df["symbol"].notna() & (df["symbol"].astype(str).str.strip() != ""), symbol)
+        df["symbol"] = df["symbol"].where(
+            df["symbol"].notna() & (df["symbol"].astype(str).str.strip() != ""),
+            symbol,
+        )
         df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
 
     return df
 
 
-def fetch_summary_with_retry(symbol: str, mkt: Market) -> pd.DataFrame | None:
-    """
-    Fetch equity(symbol).summary() with retry on rate-limit / timeout.
-    Returns None if no data or hard error.
-    """
+def _fetch_summary(symbol: str, mkt: Market) -> pd.DataFrame | None:
     while True:
         try:
             raw = mkt.equity(symbol).summary()
-            return _normalize_summary_to_df(symbol, raw)
+            return _normalize_summary(symbol, raw)
         except SystemExit:
-            logger.warning(
-                f"{symbol} — Rate-limit (SystemExit). Waiting {WAIT_TIME_ON_ERROR}s before retry..."
-            )
+            logger.warning("%s — rate-limit, retry in %ss", symbol, WAIT_TIME_ON_ERROR)
             time.sleep(WAIT_TIME_ON_ERROR)
-        except Exception as e:
-            err_str = str(e).lower()
-            if any(kw in err_str for kw in ("rate", "limit", "timeout", "429", "503")):
-                logger.warning(
-                    f"{symbol} — Rate-limit/Timeout: {e}. Waiting {WAIT_TIME_ON_ERROR}s before retry..."
-                )
+        except Exception as exc:
+            err = str(exc).lower()
+            if any(kw in err for kw in ("rate", "limit", "timeout", "429", "503")):
+                logger.warning("%s — retry in %ss: %s", symbol, WAIT_TIME_ON_ERROR, exc)
                 time.sleep(WAIT_TIME_ON_ERROR)
             else:
-                logger.error(f"{symbol} — Unexpected error: {e}. Skipping.")
+                logger.error("%s — skip: %s", symbol, exc)
                 return None
 
 
-def fetch_summary_all_symbols(symbols: list[str]) -> pd.DataFrame:
-    total = len(symbols)
-    results: list[pd.DataFrame] = []
+def _read_hose_symbols(fs: s3fs.S3FileSystem, equity_s3_path: str) -> list[str]:
+    if not fs.exists(equity_s3_path):
+        logger.error("Missing equity parquet: s3://%s", equity_s3_path)
+        return []
+
+    with fs.open(equity_s3_path, "rb") as fh:
+        df = pd.read_parquet(fh)
+
+    for col in ("symbol", "exchange", "type"):
+        if col not in df.columns:
+            logger.error("equity.parquet missing column: %s", col)
+            return []
+
+    mask = (
+        df["exchange"].astype(str).str.upper().eq("HOSE")
+        & df["type"].astype(str).str.upper().eq("STOCK")
+    )
+    symbols = (
+        df.loc[mask, "symbol"]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+        .replace("", pd.NA)
+        .dropna()
+        .drop_duplicates()
+        .tolist()
+    )
+    logger.info("Loaded %s HOSE/STOCK symbols from s3://%s", len(symbols), equity_s3_path)
+    return symbols
+
+
+def _fetch_all(symbols: list[str], run_date: date) -> pd.DataFrame:
+    mkt = Market()
+    rows: list[pd.DataFrame] = []
     empty_count = 0
     error_count = 0
+    total = len(symbols)
 
-    logger.info(f"Fetching equity summary() for {total} symbols...")
-    mkt = Market()
-
+    logger.info("Fetching summary() for %s HOSE symbols (date=%s)...", total, run_date)
     for i, symbol in enumerate(symbols, start=1):
-        df = fetch_summary_with_retry(symbol, mkt)
-
+        df = _fetch_summary(symbol, mkt)
         if df is None:
             error_count += 1
         elif df.empty:
-            logger.debug(f"[{i}/{total}] {symbol} — empty summary, skipped.")
             empty_count += 1
         else:
-            results.append(df)
+            df.insert(1, "date", run_date)
+            rows.append(df)
 
         time.sleep(SUMMARY_PER_REQ_DELAY)
-
         if i % BATCH_LOG_SIZE == 0 or i == total:
             logger.info(
-                f"Progress: {i}/{total} | Collected: {len(results)} | Empty: {empty_count} | Errors: {error_count}"
+                "Progress %s/%s | rows=%s | empty=%s | errors=%s",
+                i, total, len(rows), empty_count, error_count,
             )
 
-    if not results:
+    if not rows:
         return pd.DataFrame()
+    out = pd.concat(rows, ignore_index=True)
+    logger.info("Collected %s rows for date=%s", len(out), run_date)
+    return out
 
-    df_all = pd.concat(results, ignore_index=True)
-    logger.info(f"Total rows: {len(df_all):,} from {len(results)} symbols.")
-    return df_all
+
+# ── Partitioned write ────────────────────────────────────────────────────────
+
+def _build_partition_path(market_prefix: str, run_date: date) -> str:
+    """Build S3 path: {market_prefix}/equity/year=YYYY/month=MM/day=DD/summary.parquet"""
+    return (
+        f"{market_prefix}/equity/"
+        f"year={run_date.year:04d}/month={run_date.month:02d}/day={run_date.day:02d}/"
+        f"summary.parquet"
+    )
 
 
-def parse_args():
-    p = argparse.ArgumentParser(description="Fetch VNStock Market.equity().summary() to MinIO S3.")
-    p.add_argument("--bucket", default=DEFAULT_BUCKET, help="MinIO bucket name")
-    p.add_argument("--ref-prefix", default=DEFAULT_REF_PREFIX, help="Prefix for reference data (equity.parquet)")
-    p.add_argument("--market-prefix", default=DEFAULT_MARKET_PREFIX, help="Prefix for output market data")
+def _write_partition(
+    df: pd.DataFrame,
+    fs: s3fs.S3FileSystem,
+    s3_path: str,
+    *,
+    append: bool = False,
+) -> None:
+    """Write summary.parquet to a single day partition.
+
+    If append=True and file exists, merge + dedup by symbol (new rows win).
+    If append=False and file exists, skip.
+    """
+    if df.empty:
+        logger.warning("Nothing to write for s3://%s", s3_path)
+        return
+
+    df = _normalize_output_schema(df)
+
+    if fs.exists(s3_path):
+        if not append:
+            logger.info("Exists, skipping: s3://%s  (use --append to merge)", s3_path)
+            return
+
+        # Append mode: merge with existing
+        size = fs.size(s3_path) or 0
+        if size == 0:
+            logger.warning(
+                "Existing parquet is 0 bytes, treating as missing: s3://%s",
+                s3_path,
+            )
+            combined = df
+        else:
+            try:
+                with fs.open(s3_path, "rb") as fh:
+                    old = pd.read_parquet(fh)
+            except Exception as exc:
+                logger.error(
+                    "Cannot read existing parquet (%s) — aborting to preserve s3://%s",
+                    exc,
+                    s3_path,
+                )
+                raise
+            old = _normalize_output_schema(old)
+            combined = pd.concat([df, old], ignore_index=True)
+            logger.info("Merged with existing file: %s + %s rows", len(df), len(old))
+    else:
+        combined = df
+        logger.info("Creating new file: s3://%s", s3_path)
+
+    # Gán ingested_at cho dữ liệu mới trước khi merge
+    ingested_at = datetime.now(ICT).strftime("%Y-%m-%dT%H:%M:%S%z")
+    combined["ingested_at"] = combined["ingested_at"].fillna(ingested_at)
+
+    combined = _normalize_output_schema(combined)
+    before = len(combined)
+    combined = combined.drop_duplicates(subset=["symbol"], keep="first")
+    if len(combined) != before:
+        logger.info("Dedup (symbol): removed %s duplicate rows", before - len(combined))
+
+    with fs.open(s3_path, "wb") as fh:
+        combined.to_parquet(fh, engine="pyarrow", index=False, compression="snappy")
+    size_kb = (fs.size(s3_path) or 0) / 1024
+    logger.info("Written s3://%s (%.1f KB, %s rows)", s3_path, size_kb, len(combined))
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Fetch HOSE equity summary() daily → partitioned summary.parquet on MinIO.",
+    )
+    p.add_argument("--bucket", default=DEFAULT_BUCKET)
+    p.add_argument("--ref-prefix", default=DEFAULT_REF_PREFIX)
+    p.add_argument("--market-prefix", default=DEFAULT_MARKET_PREFIX)
+    p.add_argument(
+        "--date",
+        default=None,
+        help="Trading date YYYY-MM-DD for column ``date``. Default: today (ICT).",
+    )
     p.add_argument(
         "--append",
         action="store_true",
-        help="Merge into existing summary.parquet; deduplicate by symbol (new wins)",
+        help="Merge into existing summary.parquet in the day partition; deduplicate by symbol (new wins).",
     )
     return p.parse_args()
 
 
-def log_run_info(args: argparse.Namespace, ref_prefix: str, market_prefix: str) -> None:
-    separator = "=" * 80
-    mode = "append" if args.append else "write (skip if exists)"
-    run_at = datetime.now(ICT).strftime("%Y-%m-%d %H:%M:%S %Z")
-    logger.info(
-        "\n%s\nFetch VNStock equity summary() to MinIO S3\n%s\n"
-        "MinIO Endpoint    : %s\n"
-        "Reference source  : s3://%s/equity/equity.parquet\n"
-        "Target output     : s3://%s/equity/summary.parquet\n"
-        "Mode              : %s\n"
-        "Run at            : %s\n%s",
-        separator, separator,
-        MINIO_ENDPOINT,
-        ref_prefix,
-        market_prefix,
-        mode,
-        run_at,
-        separator,
-    )
-
-
-def main():
+def main() -> None:
     args = parse_args()
+    run_date = date.fromisoformat(args.date) if args.date else datetime.now(ICT).date()
+
     ref_prefix = f"{args.bucket}/{args.ref_prefix}"
     market_prefix = f"{args.bucket}/{args.market_prefix}"
-    log_run_info(args, ref_prefix, market_prefix)
+    equity_path = f"{ref_prefix}/equity/equity.parquet"
+    output_path = _build_partition_path(market_prefix, run_date)
+
+    sep = "=" * 80
+    mode = "append" if args.append else "write (skip if exists)"
+    logger.info(
+        "\n%s\nHOSE equity summary() daily ingestion (partitioned)\n%s\n"
+        "MinIO     : %s\n"
+        "Source    : s3://%s\n"
+        "Target    : s3://%s\n"
+        "Mode      : %s\n"
+        "Run date  : %s\n%s",
+        sep, sep, MINIO_ENDPOINT, equity_path, output_path, mode, run_date, sep,
+    )
 
     fs = s3fs.S3FileSystem(
         key=MINIO_ACCESS_KEY,
@@ -327,35 +344,25 @@ def main():
         client_kwargs={"endpoint_url": MINIO_ENDPOINT},
     )
 
-    equity_s3_path = f"{ref_prefix}/equity/equity.parquet"
-    symbols = read_symbols_from_equity_parquet(fs, equity_s3_path)
-
+    symbols = _read_hose_symbols(fs, equity_path)
     if not symbols:
-        logger.error("No symbols loaded — aborting.")
+        logger.error("No HOSE symbols — aborting.")
         return
 
-    summary_s3_path = f"{market_prefix}/equity/summary.parquet"
-    if not args.append and fs.exists(summary_s3_path):
-        logger.info(f"Exists, skipping: s3://{summary_s3_path}  (use --append to merge)")
+    df = _fetch_all(symbols, run_date)
+    if df.empty:
+        logger.warning("No summary data collected — aborting.")
         return
 
-    df_summary = fetch_summary_all_symbols(symbols)
-    if df_summary.empty:
-        logger.warning("No summary rows collected — aborting.")
-        return
+    df = _normalize_output_schema(df)
 
     gx_check_columns_to_match_set(
-        pl.from_pandas(df_summary),
-        {"column_set": list(EQUITY_SUMMARY_EXPECTED_COLUMNS), "exact_match": True},
+        pl.from_pandas(df),
+        {"column_set": list(SUMMARY_DAILY_EXPECTED_COLUMNS), "exact_match": True},
     )
 
-    if args.append:
-        append_parquet_to_s3(df_summary, fs, summary_s3_path, dedup_keys=["symbol"])
-    else:
-        write_parquet_to_s3(df_summary, fs, summary_s3_path)
-
-    separator = "=" * 80
-    logger.info("\n%s\nEquity summary ingestion complete!\n%s", separator, separator)
+    _write_partition(df, fs, output_path, append=args.append)
+    logger.info("\n%s\nHOSE summary daily ingestion complete.\n%s", sep, sep)
 
 
 if __name__ == "__main__":

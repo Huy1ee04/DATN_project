@@ -6,22 +6,26 @@ Transform: đọc toàn bộ partition news, chỉ giữ các trường cần th
 
 Source (MinIO):
   raw/reference/company/news/  → symbol, news_title, news_short_content,
-                                   news_image_url, news_source_link
+                                   news_image_url, news_source_link, public_date
 
 Output (MinIO):
-  transformed/fact/fact_stock_news.parquet
+  transformed/stage_1/fact/fact_stock_news.parquet
 """
 
 import io
 import os
 import logging
 import argparse
-from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import polars as pl
 import s3fs
 from dotenv import load_dotenv
+
+from vtit_gx.polars import (
+    gx_check_column_not_null,
+    gx_check_table_row_count_between,
+)
 
 # ── Load .env ────────────────────────────────────────────────────────────────
 _script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -38,7 +42,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("fact_stock_news_transform")
-ICT = timezone(timedelta(hours=7))
 
 # ── Config ───────────────────────────────────────────────────────────────────
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://localhost:9100")
@@ -50,7 +53,7 @@ MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minio_secret_key")
 DEFAULT_BUCKET   = os.getenv("MINIO_BUCKET", "stock-data")
 
 SRC_PREFIX   = "raw/reference/company/news"
-DST_PREFIX   = "transformed/fact"
+DST_PREFIX   = "transformed/stage_1/fact"
 DST_FILENAME = "fact_stock_news.parquet"
 
 SELECT_COLS = [
@@ -59,7 +62,9 @@ SELECT_COLS = [
     "news_short_content",
     "news_image_url",
     "news_source_link",
+    "public_date",
 ]
+OUTPUT_COLS = SELECT_COLS
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -118,10 +123,10 @@ def write_parquet(
     df: pl.DataFrame,
     fs: s3fs.S3FileSystem,
     s3_path: str,
-    overwrite: bool = False,
+    overwrite: bool = True,
 ) -> None:
     if fs.exists(s3_path) and not overwrite:
-        logger.info(f"Exists, skipping: s3://{s3_path}  (dùng --overwrite để ghi đè)")
+        logger.info(f"Exists, skipping: s3://{s3_path}")
         return
     buf = io.BytesIO()
     df.write_parquet(buf, compression="snappy")
@@ -135,9 +140,33 @@ def write_parquet(
 # ── Transform ─────────────────────────────────────────────────────────────────
 
 def transform(df: pl.DataFrame) -> pl.DataFrame:
-    """Thêm updated_at."""
-    updated_at = datetime.now(ICT).strftime("%Y-%m-%dT%H:%M:%S%z")
-    return df.with_columns(pl.lit(updated_at).alias("updated_at"))
+    """Chỉ giữ đúng các cột output, chuẩn hóa symbol, cast public_date về Date."""
+    missing_cols = sorted(set(OUTPUT_COLS) - set(df.columns))
+    if missing_cols:
+        raise ValueError(f"Missing required columns: {missing_cols}")
+
+    dtype = df["public_date"].dtype
+    if dtype == pl.Date:
+        pass
+    elif dtype in (pl.Int64, pl.Int32, pl.UInt64, pl.UInt32):
+        df = df.with_columns(pl.from_epoch(pl.col("public_date"), time_unit="ms").cast(pl.Date))
+    elif dtype in (pl.Datetime, pl.Datetime("ms"), pl.Datetime("us"), pl.Datetime("ns")):
+        df = df.with_columns(pl.col("public_date").cast(pl.Date))
+    elif dtype in (pl.Utf8, pl.String):
+        df = df.with_columns(
+            pl.col("public_date")
+            .cast(pl.Utf8, strict=False)
+            .str.slice(0, 10)
+            .str.to_date(format="%Y-%m-%d", strict=False)
+        )
+
+    return (
+        df.select(OUTPUT_COLS)
+        .drop_nulls(["symbol"])
+        .with_columns(pl.col("symbol").cast(pl.Utf8).str.strip_chars().str.to_uppercase())
+        .filter(pl.col("symbol") != "")
+        .unique()
+    )
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -147,13 +176,16 @@ def parse_args() -> argparse.Namespace:
         description="Transform: news → fact_stock_news."
     )
     p.add_argument("--bucket",    default=DEFAULT_BUCKET, help="MinIO bucket")
-    p.add_argument("--overwrite", action="store_true",    help="Ghi đè output nếu đã tồn tại")
+    p.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Bỏ qua nếu output đã tồn tại. Mặc định là ghi đè.",
+    )
     return p.parse_args()
 
 
 def log_run_info(args: argparse.Namespace, bucket: str) -> None:
     separator = "=" * 80
-    run_at = datetime.now(ICT).strftime("%Y-%m-%d %H:%M:%S %Z")
     logger.info(
         "\n%s\nTransform: news → fact_stock_news\n%s\n"
         "MinIO Endpoint : %s\n"
@@ -161,16 +193,15 @@ def log_run_info(args: argparse.Namespace, bucket: str) -> None:
         "Source         : s3://%s/%s/\n"
         "Columns        : %s\n"
         "Destination    : s3://%s/%s/%s\n"
-        "Overwrite      : %s\n"
-        "Run at         : %s\n%s",
+        "Mode           : %s\n"
+        "%s",
         separator, separator,
         MINIO_ENDPOINT,
         bucket,
         bucket, SRC_PREFIX,
         SELECT_COLS,
         bucket, DST_PREFIX, DST_FILENAME,
-        args.overwrite,
-        run_at,
+        "skip existing" if args.skip_existing else "overwrite",
         separator,
     )
 
@@ -189,8 +220,14 @@ def main() -> None:
 
     df_result = transform(df)
 
+    # ── GX Gate: Basic quality check after cleaning ───────────────────
+    logger.info("Running GX validation (Stage 1: BK not-null + Volume)...")
+    gx_check_column_not_null(df_result, {"column": "symbol"})
+    gx_check_table_row_count_between(df_result, {"min_value": 1})
+    logger.info("GX validation passed ✓")
+
     dst_path = f"{bucket}/{DST_PREFIX}/{DST_FILENAME}"
-    write_parquet(df_result, fs, dst_path, overwrite=args.overwrite)
+    write_parquet(df_result, fs, dst_path, overwrite=not args.skip_existing)
 
     separator = "=" * 80
     logger.info("\n%s\nfact_stock_news transform complete!\n%s", separator, separator)
