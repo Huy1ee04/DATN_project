@@ -3,3 +3,4 @@
 great-expectations>=1.10.0
 loguru>=0.7.0
 marshmallow>=3.7.1,<4.0.0
+clickhouse-connect>=0.7.0
