@@ -8,8 +8,11 @@
 #
 # Cổng (host):
 #   ClickHouse HTTP: 8123 (node-01), 8124 (node-02) | Native: 9000, 9001
-#   Keeper: 9181 | MinIO S3: 9100 | MinIO Console: http://localhost:9101
-#   Kafka (profile vwap): 9092 | Kafka UI: http://localhost:8080
+#   Keeper: 9181 | MinIO S3: 9100 | MinIO Console: 9101
+#   Airflow Webserver: 8083
+#   Kafka (profile vwap): 9092 | ZooKeeper: 2182 | Kafka UI: 8080
+#   Backend (profile web): 8001 | Frontend (profile web): 3001
+#   ↑ Local dev dùng 8000/3000 — container dùng 8001/3001 để tránh xung đột
 #
 # VWAP: schema ClickHouse (`vwap` DB, Kafka Engine) được mount vào clickhouse-01
 # (chạy lần đầu khi volume trống). MinIO dùng chung instance ở trên — xem vwap_system/.env.example
@@ -46,7 +49,9 @@ x-airflow-common: &airflow-common
     - ./ingestion/market:/opt/airflow/scripts/market_ingestion:ro
     - ./ingestion/reference:/opt/airflow/scripts/reference_ingestion:ro
     - ./transformed:/opt/airflow/scripts/transformed:ro
+    - ./master:/opt/airflow/scripts/master:ro
     - ./vtit_gx:/opt/airflow/packages/vtit_gx:ro
+    - ./clickhouse_student/loader:/opt/airflow/scripts/ch_loader:ro
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
     postgres:
@@ -136,6 +141,47 @@ services:
     networks:
       - datn-project-net
 
+  # --- Dashboard (FastAPI + Next.js) ---
+  # Profile 'web': chạy khi deploy hoặc khi không dùng local dev server.
+  # Local dev dùng port 8000/3000, containers dùng 8001/3001.
+  backend:
+    profiles: [web]
+    build: ./backend
+    container_name: datn-backend
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - ./backend/app:/code/app
+    environment:
+      CLICKHOUSE_HOST: clickhouse-01
+      CLICKHOUSE_PORT: 8123
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: default
+      CLICKHOUSE_DATABASE: stock_data
+    ports:
+      - "8001:8000"
+    networks:
+      - datn-project-net
+    depends_on:
+      clickhouse-01:
+        condition: service_healthy
+
+  frontend:
+    profiles: [web]
+    build: ./frontend
+    container_name: datn-frontend
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: http://localhost:8001
+    ports:
+      - "3001:3000"
+    networks:
+      - datn-project-net
+    depends_on:
+      - backend
+
   # --- VWAP streaming (bật: docker compose --profile vwap up -d) ---
   vwap-zookeeper:
     profiles: [vwap]
@@ -145,7 +191,7 @@ services:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
     ports:
-      - "2181:2181"
+      - "2182:2181"
     networks:
       - datn-project-net
 

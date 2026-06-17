@@ -42,5 +42,24 @@ airflow/standalone_admin_password.txt
 # Test / scratch files
 test_vtit_gx.py
 vnstock_api.py
+ingestion/market/mock_summary_daily.py
+ingestion/market/split_summary_daily_to_partitions.py
+
 # Logs
+logs/
 *.log
+
+# Frontend (Next.js / Node)
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.env*.local
+frontend/npm-debug.log*
+frontend/yarn-debug.log*
+frontend/yarn-error.log*
+frontend/.eslintcache
+
+# Backend (Python / FastAPI)
+backend/__pycache__/
+backend/.pytest_cache/
+backend/.env.local
