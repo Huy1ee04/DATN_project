@@ -132,6 +132,15 @@ with DAG(
         execution_timeout=timedelta(hours=4),
     )
 
+    fetch_sector_info = BashOperator(
+        task_id="fetch_sector_info",
+        bash_command=(
+            f"{_SOURCE_ENV} && "
+            f"{PYTHON} {REF_DIR}/sector_info_ingestion.py"
+        ),
+        execution_timeout=timedelta(minutes=10),
+    )
+
     # ── Dependencies ──────────────────────────────────────────────────────
     # equity_list phải xong trước (downstream đọc danh sách mã từ file này)
     fetch_equity_list >> [
@@ -140,6 +149,7 @@ with DAG(
         fetch_company_events,
         fetch_company_news,
         fetch_company_info,
+        fetch_sector_info,
     ]
 
     # ── Slack notification khi DAG hoàn thành ─────────────────────────
@@ -153,4 +163,5 @@ with DAG(
         fetch_company_events,
         fetch_company_news,
         fetch_company_info,
+        fetch_sector_info,
     ] >> pipeline_done

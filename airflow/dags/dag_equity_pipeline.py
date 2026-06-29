@@ -12,14 +12,15 @@ Flow:
   │  [fetch_equity_ohlc, fetch_equity_summary]  (song song)             │
   └──────────────────────────────────────────────────────────────────────┘
                               ↓
-  ┌── FACT TRANSFORM ───────────────────────────────────────────────────┐
+  ┌── FACT TRANSFORM ───────────────────────────────────────────┐
   │  S1_OHLCV + S1_Summary → S2_indicators → Master_FK                 │
   │       └─→ stock_signals: S2_signals → Master_FK                     │
-  └──────────────────────────────────────────────────────────────────────┘
+  │       └─→ sector_agg:   Master_FK → fact_master_sector              │
+  └──────────────────────────────────────────────────────────────┘────────┘
                               ↓
-  ┌── CLICKHOUSE LOAD ──────────────────────────────────────────────────┐
-  │  [ch_fact_equity, ch_fact_stock_signals]  (song song)                │
-  └──────────────────────────────────────────────────────────────────────┘
+  ┌── CLICKHOUSE LOAD ──────────────────────────────────────────┐
+  │  [ch_fact_equity, ch_fact_stock_signals, ch_fact_sector]              │
+  └──────────────────────────────────────────────────────────────┘────────┘
 
 Note:
   - dim_stock master đã có sẵn trên MinIO (xử lý bởi dag_dimension_pipeline lúc 07:45 ICT)
@@ -199,11 +200,29 @@ with DAG(
     equity_s2_indicators >> stock_signals_s2 >> stock_signals_master
 
     # ═══════════════════════════════════════════════════════════════════════
+    # FACT — Sector Aggregate: equity_master → fact_master_sector
+    # Cần: equity_master (dữ liệu equity đã có FK)
+    # dim_stock + dim_sector masters đã sẵn trên MinIO (từ dag_dimension_pipeline)
+    # ═══════════════════════════════════════════════════════════════════════
+
+    sector_master = BashOperator(
+        task_id="sector_master",
+        bash_command=(
+            f"{_SOURCE_ENV} && "
+            f"{PYTHON} {MASTER_DIR}/fact_master_sector.py "
+            "--overwrite"
+        ),
+        execution_timeout=timedelta(minutes=30),
+    )
+
+    equity_master >> sector_master
+
+    # ═══════════════════════════════════════════════════════════════════════
     # CLICKHOUSE LOAD — Equity facts
     # ═══════════════════════════════════════════════════════════════════════
 
     all_masters_ready = EmptyOperator(task_id="all_masters_ready")
-    [equity_master, stock_signals_master] >> all_masters_ready
+    [equity_master, stock_signals_master, sector_master] >> all_masters_ready
 
     def _ch_task(task_id: str, script: str) -> BashOperator:
         return BashOperator(
@@ -214,12 +233,13 @@ with DAG(
 
     ch_fact_equity = _ch_task("ch_load_fact_equity", "load_fact_market_equity.py")
     ch_fact_signals = _ch_task("ch_load_fact_stock_signals", "load_fact_stock_signals.py")
+    ch_fact_sector = _ch_task("ch_load_fact_sector", "load_fact_market_sector.py")
 
-    all_masters_ready >> [ch_fact_equity, ch_fact_signals]
+    all_masters_ready >> [ch_fact_equity, ch_fact_signals, ch_fact_sector]
 
     # ── Slack notification khi DAG hoàn thành ─────────────────────────
     pipeline_done = EmptyOperator(
         task_id="pipeline_done",
         on_success_callback=slack_on_success,
     )
-    [ch_fact_equity, ch_fact_signals] >> pipeline_done
+    [ch_fact_equity, ch_fact_signals, ch_fact_sector] >> pipeline_done

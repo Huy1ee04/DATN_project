@@ -12,6 +12,7 @@ Flow:
   │  dim_stock:      S1 → S2 → Master                                  │
   │  dim_index:      S1 → S2 → Master                                  │
   │  dim_date_event: S1 → S2 → Master                                  │
+  │  dim_sector:     S1 → S2 → Master                                  │
   └─────────────┬──────────────────────────────────────────────────────┘
                 ↓
   ┌── BRIDGE (cần dim_stock + dim_index masters) ──────────────────────┐
@@ -189,6 +190,41 @@ with DAG(
     dim_date_s1 >> dim_date_s2 >> dim_date_master
 
     # ═══════════════════════════════════════════════════════════════════════
+    # DIMENSION — dim_sector (S1 → S2 → Master)
+    # ═══════════════════════════════════════════════════════════════════════
+
+    dim_sector_s1 = BashOperator(
+        task_id="dim_sector_s1",
+        bash_command=(
+            f"{_SOURCE_ENV} && "
+            f"{PYTHON} {TRANSFORMED_DIR}/stage_1/dim_sector_info.py "
+            "--overwrite"
+        ),
+        execution_timeout=timedelta(minutes=15),
+    )
+
+    dim_sector_s2 = BashOperator(
+        task_id="dim_sector_s2",
+        bash_command=(
+            f"{_SOURCE_ENV} && "
+            f"{PYTHON} {TRANSFORMED_DIR}/stage_2/dim_sector_info.py "
+            "--overwrite"
+        ),
+        execution_timeout=timedelta(minutes=15),
+    )
+
+    dim_sector_master = BashOperator(
+        task_id="dim_sector_master",
+        bash_command=(
+            f"{_SOURCE_ENV} && "
+            f"{PYTHON} {MASTER_DIR}/dim_master_sector.py"
+        ),
+        execution_timeout=timedelta(minutes=15),
+    )
+
+    dim_sector_s1 >> dim_sector_s2 >> dim_sector_master
+
+    # ═══════════════════════════════════════════════════════════════════════
     # BRIDGE — bridge_stock_index (S1 → S2 SCD2 → Master FK)
     # Cần: dim_stock_master + dim_index_master (surrogate keys)
     # ═══════════════════════════════════════════════════════════════════════
@@ -231,7 +267,7 @@ with DAG(
     # ═══════════════════════════════════════════════════════════════════════
 
     all_masters_ready = EmptyOperator(task_id="all_masters_ready")
-    [dim_stock_master, dim_index_master, dim_date_master, bridge_master] >> all_masters_ready
+    [dim_stock_master, dim_index_master, dim_date_master, dim_sector_master, bridge_master] >> all_masters_ready
 
     def _ch_task(task_id: str, script: str) -> BashOperator:
         return BashOperator(
@@ -243,11 +279,12 @@ with DAG(
     ch_dim_stock = _ch_task("ch_load_dim_stock", "load_dim_stock.py")
     ch_dim_index = _ch_task("ch_load_dim_index", "load_dim_index.py")
     ch_dim_date = _ch_task("ch_load_dim_date_event", "load_dim_date_event.py")
+    ch_dim_sector = _ch_task("ch_load_dim_sector", "load_dim_sector.py")
     ch_bridge = _ch_task("ch_load_bridge", "load_bridge_stock_index.py")
 
     # dims song song → bridge
-    all_masters_ready >> [ch_dim_stock, ch_dim_index, ch_dim_date]
-    [ch_dim_stock, ch_dim_index, ch_dim_date] >> ch_bridge
+    all_masters_ready >> [ch_dim_stock, ch_dim_index, ch_dim_date, ch_dim_sector]
+    [ch_dim_stock, ch_dim_index, ch_dim_date, ch_dim_sector] >> ch_bridge
 
     # ── Slack notification khi DAG hoàn thành ─────────────────────────
     pipeline_done = EmptyOperator(

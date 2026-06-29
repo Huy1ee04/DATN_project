@@ -115,12 +115,18 @@ def _get_log_url(context: dict) -> str:
     ti = context.get("task_instance")
     if not ti:
         return ""
-    return (
-        f"http://localhost:8083/log?"
-        f"dag_id={ti.dag_id}&task_id={ti.task_id}"
-        f"&execution_date={ti.execution_date.isoformat()}"
-        f"&try_number={ti.try_number}"
-    )
+
+    # Đọc base URL từ biến môi trường hoặc fallback về localhost
+    base_url = _load_env_var("AIRFLOW_WEBSERVER_BASE_URL", "http://localhost:8083")
+
+    import urllib.parse
+    params = {
+        "dag_id": ti.dag_id,
+        "task_id": ti.task_id,
+        "execution_date": ti.execution_date.isoformat(),
+        "try_number": ti.try_number,
+    }
+    return f"{base_url}/log?{urllib.parse.urlencode(params)}"
 
 
 def _get_traceback(context: dict) -> str:
@@ -274,14 +280,11 @@ def slack_on_failure(context: dict) -> None:
             },
         },
         {
-            "type": "actions",
-            "elements": [
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "📄 View Full Log"},
-                    "url": log_url,
-                },
-            ],
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"🔗 *<{log_url}|Click here to View Full Log on Airflow>*",
+            },
         },
     ]
 
