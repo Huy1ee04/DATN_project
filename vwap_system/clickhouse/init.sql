@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS vwap.trades_raw
 ENGINE = MergeTree()
 PARTITION BY toDate(received_at)
 ORDER BY (symbol, received_at)
-TTL toDate(received_at) + INTERVAL 90 DAY
+TTL toDate(received_at) + INTERVAL 45 DAY
 SETTINGS index_granularity = 8192;
 
 -- ---------------------------------------------------------------
@@ -85,7 +85,7 @@ CREATE TABLE IF NOT EXISTS vwap.ohlc_raw
 ENGINE = MergeTree()
 PARTITION BY toDate(candle_time)
 ORDER BY (symbol, candle_time)
-TTL toDate(received_at) + INTERVAL 90 DAY
+TTL toDate(received_at) + INTERVAL 45 DAY
 SETTINGS index_granularity = 8192;
 
 -- ---------------------------------------------------------------
@@ -149,7 +149,7 @@ CREATE TABLE IF NOT EXISTS vwap.alerts
 )
 ENGINE = MergeTree()
 ORDER BY (alert_time, symbol)
-TTL toDate(alert_time) + INTERVAL 90 DAY;
+TTL toDate(alert_time) + INTERVAL 45 DAY;
 
 -- ---------------------------------------------------------------
 -- 8. alerts_v2: multi-signal alerts (VWAP, RSI, Volume Spike)
@@ -169,4 +169,4 @@ CREATE TABLE IF NOT EXISTS vwap.alerts_v2
 )
 ENGINE = MergeTree()
 ORDER BY (alert_time, symbol, rule_name)
-TTL toDate(alert_time) + INTERVAL 90 DAY;
+TTL toDate(alert_time) + INTERVAL 45 DAY;
