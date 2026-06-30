@@ -52,6 +52,7 @@ x-airflow-common: &airflow-common
     - ./master:/opt/airflow/scripts/master:ro
     - ./vtit_gx:/opt/airflow/packages/vtit_gx:ro
     - ./clickhouse_student/loader:/opt/airflow/scripts/ch_loader:ro
+    - ./vwap_system/backup:/opt/airflow/scripts/vwap_backup:ro
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
     postgres:
