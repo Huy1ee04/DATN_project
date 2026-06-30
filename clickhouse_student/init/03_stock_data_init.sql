@@ -242,3 +242,40 @@ ORDER BY (stock_key, public_date_key);
 CREATE TABLE IF NOT EXISTS stock_data.fact_stock_news ON CLUSTER cluster_student
 AS stock_data.fact_stock_news_local
 ENGINE = Distributed(cluster_student, stock_data, fact_stock_news_local, rand());
+
+
+-- ── dim_sector ──────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS stock_data.dim_sector_local ON CLUSTER cluster_student (
+    sector_key      Int32,
+    sector          String
+) ENGINE = ReplicatedReplacingMergeTree(
+    '/clickhouse/tables/{shard}/stock_data/dim_sector',
+    '{replica}'
+)
+ORDER BY (sector_key);
+
+CREATE TABLE IF NOT EXISTS stock_data.dim_sector ON CLUSTER cluster_student
+AS stock_data.dim_sector_local
+ENGINE = Distributed(cluster_student, stock_data, dim_sector_local, rand());
+
+
+-- ── fact_market_sector ──────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS stock_data.fact_market_sector_local ON CLUSTER cluster_student (
+    sector_key          Int32,
+    date_key            Int32,
+    price_change_pct    Nullable(Float64),
+    total_trade_value   Nullable(Float64),
+    total_market_cap    Nullable(Float64),
+    avg_pe              Nullable(Float64),
+    avg_pb              Nullable(Float64),
+    avg_eps             Nullable(Float64),
+    stock_count         Nullable(Int32)
+) ENGINE = ReplicatedReplacingMergeTree(
+    '/clickhouse/tables/{shard}/stock_data/fact_market_sector',
+    '{replica}'
+)
+ORDER BY (sector_key, date_key);
+
+CREATE TABLE IF NOT EXISTS stock_data.fact_market_sector ON CLUSTER cluster_student
+AS stock_data.fact_market_sector_local
+ENGINE = Distributed(cluster_student, stock_data, fact_market_sector_local, rand());
