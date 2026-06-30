@@ -58,6 +58,7 @@ frontend/npm-debug.log*
 frontend/yarn-debug.log*
 frontend/yarn-error.log*
 frontend/.eslintcache
+frontend/public/
 
 # Backend (Python / FastAPI)
 backend/__pycache__/
