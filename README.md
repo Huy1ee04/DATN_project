@@ -1,88 +1,93 @@
-* Module vwap
+# Hệ Thống Phân Tích Dữ Liệu Chứng Khoán (Batch & Real-time Hybrid Pipeline)
 
-uv sync --extra vwap
+Hệ thống thu thập, xử lý và phân tích dữ liệu chứng khoán Việt Nam kết hợp luồng xử lý theo lô (Batch) phục vụ phân tích dữ liệu lịch sử và luồng xử lý thời gian thực (Real-time) phát hiện cảnh báo sớm. 
 
-docker compose --profile vwap up -d
-
-1, mở terminal 1 (lấy dữ liệu thị trường đưa vào kafka topic): 
-uv run vwap_system/producer/ohlc_producer.py
-2, mở terminal 2 (đọc dữ liệu từ kafka topic, tính toán VWAP và đưa ra cảnh báo:
-uv run vwap_system/alert_detector/detector.py
-3, mở terminal 3 (hiển thị dữ liệu và cảnh báo):
-uv run streamlit run vwap_system/dashboard/app.py
-4, mở terminal 4 (back up dữ liệu thô cuối ngày):
-uv run vwap_system/backup/minio_exporter.py
+Hệ thống được thiết kế theo kiến trúc lai Lambda & Medallion, sử dụng hồ dữ liệu MinIO, kho dữ liệu phân tích ClickHouse, điều phối bởi Apache Airflow và trực quan hóa qua Next.js 14 & FastAPI.
 
 ---
 
-## Module Airflow (ingestion theo lịch, vnstock_data)
+## 🚀 Tính Năng Chính
 
-Chuẩn bị file `.env` ở **thư mục gốc repo** (được mount vào container tại `/opt/airflow/.env`):
+1. **Luồng xử lý theo lô (Batch Pipeline):**
+   * **Ingestion:** Thu thập định kỳ dữ liệu tham chiếu (doanh nghiệp, sự kiện, tin tức, chỉ số) và dữ liệu giao dịch từ thư viện Vnstock.
+   * **Transform (Medallion):** Chuẩn hóa, biến đổi qua 3 tầng chất lượng dữ liệu (Bronze $\rightarrow$ Silver $\rightarrow$ Gold/Master) bằng thư viện hiệu năng cao **Polars**.
+   * **Quality Control:** Kiểm định chất lượng dữ liệu tại mỗi cổng (validation gate) bằng framework **Great Expectations** (qua wrapper tự xây dựng `vtit_gx` hoạt động trực tiếp trên Polars).
+   * **OLAP Load:** Đồng bộ hoàn toàn dữ liệu từ hồ dữ liệu MinIO sang kho dữ liệu ClickHouse (1 Shard, 2 Replicas, điều phối qua ClickHouse Keeper) để phục vụ phân tích.
 
-- `VNSTOCK_API_KEY` — bắt buộc cho bước cài vnstock qua CLI installer.
-- `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` / `MINIO_BUCKET` — khớp với service `minio` trong `docker-compose.yml` (mặc định: `minio_access_key`, `minio_secret_key`, `stock-data`).
-- Các biến khác script cần (ví dụ `SYMBOLS`, …).
+2. **Luồng xử lý thời gian thực (Real-time Pipeline):**
+   * **Streaming Ingestion:** Tiếp nhận nến giao dịch 1 phút từ WebSocket API của DNSE qua `ohlc_producer.py` đẩy vào **Apache Kafka** broker.
+   * **OLAP Ingestion:** ClickHouse tự động tiêu thụ từ Kafka thông qua cơ chế **Kafka Engine + Materialized View** ghi vào bảng nội bộ.
+   * **Alert Detection:** Định kỳ quét ClickHouse tính toán chỉ báo động (VWAP tích lũy, dải Bollinger Bands $2\sigma$, RSI, Volume Spike) qua `detector.py` để phát hiện cảnh báo kết hợp đa tín hiệu.
+   * **Slack Alert:** Tích hợp gửi thông báo đẩy lập tức đến kênh Slack khi phát hiện tín hiệu nghiêm trọng (`CRITICAL`).
 
-**Lưu ý mạng Docker:** các DAG ghi đè `MINIO_ENDPOINT=http://minio:9000` sau khi `source .env`, vì trong container `localhost` không trỏ tới MinIO. Trên máy host, script Python vẫn có thể dùng `MINIO_ENDPOINT=localhost:9100` trong `.env`.
+3. **Quản lý vòng đời dữ liệu (Data Lifecycle):**
+   * Tự động lưu trữ (archive) dữ liệu nến thô/cảnh báo thời gian thực thành file Parquet trên MinIO hàng ngày.
+   * Tự động dọn dẹp (purge) dữ liệu ClickHouse cũ hơn 30 ngày để tối ưu hóa hiệu năng bộ nhớ.
 
-### Lần đầu: khởi động stack + tạo venv vnstock (1 lần)
+4. **Ứng dụng trực quan hóa (Dashboard):**
+   * **Backend:** FastAPI phục vụ dữ liệu truy vấn thông qua các endpoints REST API tối ưu hóa.
+   * **Frontend:** Next.js 14 hiển thị Dashboard tổng quan thị trường, chi tiết cổ phiếu (TradingView Lightweight Charts), phân tích ngành (Nivo Treemap), bộ lọc cổ phiếu (`screener`) và giám sát độ trễ luồng streaming.
 
-Trong thư mục repo:
+---
 
-```bash
-# 1) Bật ClickHouse, MinIO, Postgres, Airflow (scheduler + webserver)
-docker compose up -d
+## 📁 Cấu Trúc Dự Án
 
-# 2) Tạo volume vnstock-venv + vnstock-home và cài vnstock_data (profile setup)
-docker compose --profile setup run --rm vnstock-setup
+```
+├── airflow/               # Cấu hình Apache Airflow & DAGs điều phối
+├── backend/               # Mã nguồn API Backend (FastAPI, Python)
+├── frontend/              # Giao diện người dùng (Next.js 14, TypeScript)
+├── ingestion/             # Tập hợp các script thu thập dữ liệu thô (raw)
+├── transformed/           # Script biến đổi dữ liệu (Stage 1 & Stage 2)
+├── master/                # Script chuẩn hóa nghiệp vụ dữ liệu lên tầng Master
+├── vwap_system/           # Luồng xử lý realtime (WebSocket, Kafka, Alert)
+├── vtit_gx/               # Thư viện kiểm định chất lượng (Polars + Great Expectations)
+├── clickhouse_student/    # Cấu hình cụm ClickHouse & SQL schemas
+├── scripts/               # Script tiện ích và tự động hóa vận hành
+├── docker-compose.yml     # Định nghĩa toàn bộ hạ tầng dịch vụ Docker
+└── README.md
 ```
 
-Bước (2) tải installer từ vnstocks.com, cài dependency vào volume `vnstock-venv`, đăng ký thiết bị/license vào volume `vnstock-home`. Chỉ chạy lại khi cần cài lại môi trường.
+---
 
-Nếu venv đã tồn tại, `vnstock-setup` vẫn **đồng bộ** package từ `airflow/requirements.txt` (Great Expectations, loguru). Package `vtit_gx` được mount vào Airflow qua `PYTHONPATH`, không cần pip-install.
+## 🛠️ Hướng Dẫn Khởi Chạy Nhanh
 
+### 1. Thiết lập Môi Trường
+Sao chép tệp cấu hình mẫu và khai báo các khóa bí mật của bạn:
 ```bash
+cp .env.example .env
+# Chỉnh sửa tệp .env điền DNSE_API_KEY, SLACK_WEBHOOK_URL, ...
+```
+
+### 2. Khởi Động Hạ Tầng (Docker)
+Khởi chạy ClickHouse, Kafka, MinIO, PostgreSQL và Airflow:
+```bash
+docker compose up -d
+```
+
+### 3. Thiết Lập Môi Trường Ảo Airflow (Setup 1 lần đầu)
+```bash
+# Khởi chạy setup cài đặt thư viện cho Airflow
 docker compose --profile setup run --rm vnstock-setup
+
+# Khởi động lại các tác vụ Airflow sau khi cài đặt thành công
 docker compose up -d airflow-scheduler airflow-webserver
 ```
+*Truy cập giao diện quản lý Airflow tại: [http://localhost:8083](http://localhost:8083) (User: `admin` / Pass: `admin`)*
 
-### Cài lại venv vnstock từ đầu
-
-Service `vnstock-setup` **bỏ qua** cài đặt nếu đã có `/opt/vnstock-venv/bin/python` trong volume. Để làm sạch và chạy lại:
-
+### 4. Vận Hành Luồng Real-time (WebSocket & Kafka)
+Khởi chạy cụm Kafka và chạy các tiến trình Python:
 ```bash
-docker compose down
-docker volume rm datn_project_vnstock-venv datn_project_vnstock-home
-# Nếu tên project khác, xem đúng tên: docker volume ls | grep vnstock
-docker compose up -d
-docker compose --profile setup run --rm vnstock-setup
+# Khởi động hạ tầng realtime trong docker
+docker compose --profile vwap up -d
+
+# Kích hoạt luồng thời gian thực bằng bash script tự động
+bash scripts/start_vwap.sh
 ```
 
-### Mở UI và trigger DAG
+---
 
-```bash
-# Webserver map cổng host 8083 → 8080 trong container
-open http://localhost:8083
-```
+## 📈 Giám Sát và Tài Liệu API
 
-- DAG mặc định **paused** (`AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION`). Trong UI: bật toggle **Unpause** cho DAG cần chạy.
-- **Trigger:** nút **Trigger DAG** (hoặc *Trigger DAG w/ config* nếu DAG hỗ trợ `run_date` trong docstring).
-
-Nếu chưa có tài khoản đăng nhập Airflow, tạo một lần (đổi user/password theo ý bạn):
-
-```bash
-docker compose exec airflow-webserver airflow users create \
-  --username admin \
-  --firstname Admin \
-  --lastname User \
-  --role Admin \
-  --email admin@example.com \
-  --password admin
-```
-
-### Kiểm tra nhanh
-
-```bash
-docker compose ps
-docker compose logs -f airflow-scheduler
-```
+* **FastAPI Swagger UI:** [http://localhost:8000/docs](http://localhost:8000/docs) (Chạy cục bộ) hoặc [http://localhost:8001/docs](http://localhost:8001/docs) (Chạy docker).
+* **Kafka UI:** [http://localhost:8080](http://localhost:8080)
+* **MinIO Console:** [http://localhost:9001](http://localhost:9001)
