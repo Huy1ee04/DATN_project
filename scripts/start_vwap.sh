@@ -10,6 +10,10 @@ DATE=$(date +%Y-%m-%d)
 
 mkdir -p "$LOG_DIR" "$PID_DIR"
 
+# Kill previous instances (nếu còn sống) trước khi start mới
+"$PROJECT_DIR/scripts/stop_vwap.sh" 2>/dev/null || true
+sleep 2
+
 echo "[$DATE $(date +%H:%M:%S)] Starting VWAP services..." >> "$LOG_DIR/cron.log"
 
 # 1. OHLC Producer

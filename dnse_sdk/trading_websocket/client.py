@@ -469,7 +469,12 @@ class TradingClient:
                     except Exception as reconnect_error:
                         logger.error(f"Reconnection failed: {reconnect_error}")
                         self._emit("error", reconnect_error)
-                        break
+                        # Reset connection retry count and wait before next attempt
+                        if self._connection:
+                            self._connection._retry_count = 0
+                        logger.info("Will retry reconnection in 60s...")
+                        await asyncio.sleep(60)
+                        continue
                 else:
                     self._emit("error", e)
                     break
@@ -681,6 +686,17 @@ class TradingClient:
 
         # Update pong time
         self._last_pong_time = time.time()
+
+        # Restart heartbeat loop (it exits when is_connected becomes False)
+        if self.heartbeat_interval > 0:
+            if self._heartbeat_task and not self._heartbeat_task.done():
+                self._heartbeat_task.cancel()
+                try:
+                    await self._heartbeat_task
+                except asyncio.CancelledError:
+                    pass
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+            logger.info("Heartbeat loop restarted after reconnection")
 
         # Emit reconnected event
         self._emit("reconnected", {"session_id": self._session_id})
