@@ -205,6 +205,18 @@ def resolve_surrogate_keys(
         df_bridge.shape[0],
     )
 
+    # Loại bỏ các dòng mồ côi (orphan keys) để tránh lỗi chất lượng dữ liệu (GX) và Clickhouse load (PK NOT NULL)
+    if n_orphan_stock > 0 or n_orphan_index > 0:
+        logger.warning(
+            "Dropping rows due to missing surrogate keys (orphan keys: %d stock, %d index).",
+            n_orphan_stock,
+            n_orphan_index
+        )
+        df_bridge = df_bridge.filter(
+            pl.col(STOCK_SURROGATE_KEY).is_not_null() &
+            pl.col(INDEX_SURROGATE_KEY).is_not_null()
+        )
+
     # Sắp xếp cột: surrogate keys đầu → natural keys → SCD columns
     output_cols = [
         STOCK_SURROGATE_KEY,
